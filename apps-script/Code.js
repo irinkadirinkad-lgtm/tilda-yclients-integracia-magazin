@@ -44,15 +44,32 @@ function ycGet_(path, params) {
     });
     if (parts.length) qs = '?' + parts.join('&');
   }
-  var resp = UrlFetchApp.fetch(YC_BASE_ + path + qs, { method: 'get', headers: ycHeaders_(), muteHttpExceptions: true });
+  var resp = ycFetch_(YC_BASE_ + path + qs, { method: 'get', headers: ycHeaders_(), muteHttpExceptions: true }, true);
   return ycParse_(resp, 'GET ' + path);
 }
 
 function ycPost_(path, payload) {
-  var resp = UrlFetchApp.fetch(YC_BASE_ + path, {
+  var resp = ycFetch_(YC_BASE_ + path, {
     method: 'post', headers: ycHeaders_(), payload: JSON.stringify(payload), muteHttpExceptions: true
-  });
+  }, false);
   return ycParse_(resp, 'POST ' + path);
+}
+
+// Единая точка обращения к YClients с вежливым повтором.
+// 429 («слишком часто») — повторяем ВСЕГДА: запрос заведомо не обработан, задвоить нечего.
+// 5xx (сбой на их стороне) — повторяем ТОЛЬКО для чтения (idempotent=true): повторить POST
+// создания операции опасно — она могла пройти, а ответ потеряться, и получится вторая продажа.
+// Ждём 3 → 9 → 20 секунд; дольше нельзя — у триггера Apps Script всего 6 минут на прогон.
+function ycFetch_(url, opts, idempotent) {
+  var WAITS = [3000, 9000, 20000], resp = null;
+  for (var i = 0; i <= WAITS.length; i++) {
+    resp = UrlFetchApp.fetch(url, opts);
+    var code = resp.getResponseCode();
+    var retryable = (code === 429) || (idempotent && code >= 500 && code < 600);
+    if (!retryable || i === WAITS.length) return resp;
+    Utilities.sleep(WAITS[i]);
+  }
+  return resp;
 }
 
 function ycDelete_(path) {
@@ -212,8 +229,8 @@ function setTxComment_(docId, t, text) {
     master_id: Number(t.master_id) || Number(requireProp_('WRITEOFF_MASTER_ID')),
     comment: text
   };
-  var resp = UrlFetchApp.fetch(YC_BASE_ + '/storage_operations/goods_transactions/' + companyId_() + '/' + t.id,
-    { method: 'put', headers: ycHeaders_(), payload: JSON.stringify(body), muteHttpExceptions: true });
+  var resp = ycFetch_(YC_BASE_ + '/storage_operations/goods_transactions/' + companyId_() + '/' + t.id,
+    { method: 'put', headers: ycHeaders_(), payload: JSON.stringify(body), muteHttpExceptions: true }, true);
   if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
     throw new Error('PUT подписи позиции ' + t.id + ' → HTTP ' + resp.getResponseCode() + ': ' + resp.getContentText().slice(0, 200));
   }
@@ -224,7 +241,7 @@ function setTxComment_(docId, t, text) {
 function setDocumentComment_(docId, text) {
   var path = '/storage_operations/documents/' + companyId_() + '/' + docId;
   var cur = ycGet_(path), d = (cur && cur.data) || {};
-  var resp = UrlFetchApp.fetch(YC_BASE_ + path, {
+  var resp = ycFetch_(YC_BASE_ + path, {
     method: 'put', headers: ycHeaders_(), muteHttpExceptions: true,
     payload: JSON.stringify({
       comment: text,
@@ -232,7 +249,7 @@ function setDocumentComment_(docId, text) {
       storage_id: d.storage_id,
       create_date: d.create_date        // полное «ГГГГ-ММ-ДД ЧЧ:ММ:СС», иначе 400
     })
-  });
+  }, true);
   if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
     throw new Error('PUT комментария → HTTP ' + resp.getResponseCode() + ': ' + resp.getContentText().slice(0, 200));
   }
