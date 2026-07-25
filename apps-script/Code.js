@@ -347,6 +347,7 @@ function pushFeed_(goods) {
 
 // ─── Поток B: приём заказа Тильды ──────────────────────────────────────────────
 function doPost(e) {
+  bumpHit_('HITS_POST');
   try {
     var order = parseTildaOrder_(e);
     // Не распознали заказ — НЕ молчим: в журнал + письмо, иначе заказ потеряется незаметно.
@@ -391,6 +392,16 @@ function doPost(e) {
     reportError_('Приём заказа с сайта (doPost)', err);
     return jsonOut_({ ok: false, error: String(err && err.message || err) });
   }
+}
+
+// Счётчик обращений к веб-приложению — чтобы понимать, дошёл ли запрос ВООБЩЕ
+// (без записи в журнал, чтобы не засорять его чужими/ботовыми запросами).
+function bumpHit_(key) {
+  try {
+    var n = Number(props_().getProperty(key) || 0) + 1;
+    props_().setProperty(key, String(n));
+    props_().setProperty(key + '_LAST', String(new Date()));
+  } catch (ignore) {}
 }
 
 // Имена полей вебхука + значения «номерных» полей, без персональных данных клиента.
@@ -464,7 +475,7 @@ function markProcessed_(tranid) { props_().setProperty('order_' + tranid, String
 // ─── Диагностика (doGet, гейт по секрету; после разбора удалить) ───────────────
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (p.secret !== DIAG_SECRET_) return jsonOut_({ ok: false, error: 'forbidden' });
+  if (p.secret !== DIAG_SECRET_) { bumpHit_('HITS_GET_DENIED'); return jsonOut_({ ok: false, error: 'forbidden' }); }
   try {
     switch (p.action) {
       case 'ping': return jsonOut_({ ok: true, ts: String(new Date()) });
@@ -522,7 +533,9 @@ function doGet(e) {
       case 'previewFeed': { var pi = String(p.goods || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean); var pg = fetchGoodsByIds_(pi); return jsonOut_({ ok: true, importXml: buildImportXml_(pg), offersXml: buildOffersXml_(pg) }); }
       // Наполнить master-список good_id (частями, чтобы не упереться в длину URL).
       case 'seedMaster': { var sm = String(p.ids || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean); addMasterIds_(sm); return jsonOut_({ ok: true, added: sm.length, total: masterIds_().length }); }
-      case 'master': return jsonOut_({ ok: true, masterCount: masterIds_().length, lastSync: prop_('LAST_SYNC_TS') });
+      case 'master': return jsonOut_({ ok: true, masterCount: masterIds_().length, lastSync: prop_('LAST_SYNC_TS'),
+        обращенийPOST: prop_('HITS_POST') || 0, последнийPOST: prop_('HITS_POST_LAST') || '—',
+        отказовGET: prop_('HITS_GET_DENIED') || 0, последнийОтказGET: prop_('HITS_GET_DENIED_LAST') || '—' });
       // Создать таблицу-журнал и запомнить её id.
       case 'createControl': { var cs = SpreadsheetApp.create('tilda-yclients — журнал интеграции'); props_().setProperty('CONTROL_SHEET_ID', cs.getId()); statusSheet_(); return jsonOut_({ ok: true, id: cs.getId(), url: cs.getUrl() }); }
       case 'installTriggers': return jsonOut_({ ok: true, triggers: installTriggers_() });
