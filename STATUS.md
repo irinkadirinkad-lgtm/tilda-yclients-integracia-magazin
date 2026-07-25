@@ -14,6 +14,11 @@
 - `apps-script/appsscript.json` — манифест: Europe/Moscow, V8, web app `USER_DEPLOYING` +
   `ANYONE_ANONYMOUS` (иначе Тильда не сможет постить вебхук без авторизации).
 - `apps-script/.clasp.json` — scriptId (не секрет).
+- `.claude/skills/my-skill-proverka-integracii/` — **скил «Проверка здоровья интеграции»**
+  (создан 26.07): одной процедурой сверяются последняя синхронизация, изменения, очередь
+  повторов, журнал, листы и триггеры; отдельно — как читать реальную витрину и что делать,
+  если заказ «не дошёл». Применять при любом «всё ли в порядке?», после реальных заказов,
+  после правок кода и в начале новой сессии по проекту.
 - Секретов в коде НЕТ: `PARTNER_TOKEN`, `USER_TOKEN`, `TILDA_CML_*`, `COMPANY_ID`,
   `WRITEOFF_MASTER_ID`, `STORE_STORAGE_ID`, `CONTROL_SHEET_ID` — в Script Properties.
   `.clasprc.json` (OAuth-токен) в `.gitignore` — не коммитить никогда.
