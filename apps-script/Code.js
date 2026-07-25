@@ -370,25 +370,47 @@ function doPost(e) {
       else unmatched.push(it);
     });
 
-    // Номер заказа — СВОЙ, по порядку (Тильда своей нумерацией управлять не даёт: её tranid —
-    // внутренний id лида). Номер берём из счётчика ORDER_SEQ_NEXT и расходуем только если
-    // реально есть что списывать. Id Тильды пишем в скобках — по нему всегда можно сверить.
-    var ourNo = null;
+    // Номер заказа берём ТОТ, ЧТО ПРИСЫЛАЕТ ТИЛЬДА (Ирина настроила передачу номера ЗАЯВКИ —
+    // это её сквозная нумерация). Своего счётчика не держим и в скобках ничего не дублируем,
+    // чтобы не было двух номеров (решение Ирины 25.07).
     if (items.length) {
-      ourNo = nextOrderNo_();
-      createOnlineSale_(items, "Заказ с интернет-магазина EL'NATUREL SHOP №" + ourNo + ' (Тильда ' + order.tranid + ')');
+      createOnlineSale_(items, "Заказ с интернет-магазина EL'NATUREL SHOP №" + order.tranid);
     }
     markProcessed_(order.tranid);
     if (unmatched.length) {
       logUnmatched_('order_no_match', unmatched.map(function (u) { return (u.name || '') + ' [' + (u.externalid || u.sku || '') + ']'; }));
-      reportError_('Заказ с сайта №' + (ourNo || '?') + ' (Тильда ' + order.tranid + ')', new Error('Не сопоставлены позиции: ' + unmatched.length));
+      reportError_('Заказ с сайта №' + order.tranid, new Error('Не сопоставлены позиции: ' + unmatched.length));
     }
-    logStatus_('Заказ с сайта', 'OK', '№' + (ourNo || '—') + ', Тильда ' + order.tranid + ', списано позиций: ' + items.length, new Date());
-    return jsonOut_({ ok: true, orderNo: ourNo, tranid: order.tranid, written: items.length, unmatched: unmatched.length });
+    logStatus_('Заказ с сайта', 'OK', '№' + order.tranid + ', списано позиций: ' + items.length +
+      ' | поля вебхука: ' + payloadFields_(e), new Date());
+    return jsonOut_({ ok: true, orderNo: order.tranid, written: items.length, unmatched: unmatched.length });
   } catch (err) {
+    // Ошибку пишем И в журнал (раньше уходила только письмом — в журнале следа не оставалось).
+    logStatus_('Заказ с сайта', 'ОШИБКА', String(err && err.message || err).slice(0, 250) +
+      ' | поля вебхука: ' + payloadFields_(e), new Date());
     reportError_('Приём заказа с сайта (doPost)', err);
     return jsonOut_({ ok: false, error: String(err && err.message || err) });
   }
+}
+
+// Имена полей вебхука + значения «номерных» полей, без персональных данных клиента.
+// Нужно, чтобы по первому реальному заказу увидеть, что именно присылает Тильда.
+function payloadFields_(e) {
+  try {
+    var p = (e && e.parameter) || {}, keys = Object.keys(p);
+    var body = null, raw = e && e.postData && e.postData.contents;
+    if (raw && String(raw).trim().charAt(0) === '{') { try { body = JSON.parse(raw); } catch (ig) {} }
+    if (body) keys = keys.concat(Object.keys(body).map(function (k) { return 'json:' + k; }));
+    var nums = [];
+    [p, body || {}].forEach(function (src) {
+      Object.keys(src).forEach(function (k) {
+        if (/id$|number|zayav|заявк|order/i.test(k) && typeof src[k] !== 'object') {
+          nums.push(k + '=' + String(src[k]).slice(0, 40));
+        }
+      });
+    });
+    return keys.join(',') + (nums.length ? ' || номерные: ' + nums.join(' ') : '');
+  } catch (e2) { return '?'; }
 }
 
 // Разбор вебхука заказа Тильды. Поддерживаем ОБА формата, т.к. Тильда может присылать и
@@ -435,22 +457,6 @@ function rawOrderPayload_(e) {
   return String(out).slice(0, 900);
 }
 
-// ─── Сквозная нумерация заказов (наша, не Тильды) ─────────────────────────────
-// Ирина ведёт заказы по своему порядку (…181, 182, 183…). Тильда присылает только свой
-// внутренний tranid и настройки нумерации не имеет → номер присваиваем сами.
-// ORDER_SEQ_NEXT = номер, который получит СЛЕДУЮЩИЙ заказ. Расходуется только когда есть
-// что списывать; повторный вебхук того же заказа номер не тратит (отсекается идемпотентностью).
-function nextOrderNo_() {
-  var lock = LockService.getScriptLock();
-  try { lock.waitLock(10000); } catch (e) { /* работаем без блокировки, заказы редкие */ }
-  try {
-    var n = Number(prop_('ORDER_SEQ_NEXT') || 1);
-    if (!isFinite(n) || n < 1) n = 1;
-    props_().setProperty('ORDER_SEQ_NEXT', String(n + 1));
-    return n;
-  } finally { try { lock.releaseLock(); } catch (e) {} }
-}
-
 // ─── Идемпотентность обработанных заказов ─────────────────────────────────────
 function isProcessed_(tranid) { return !!prop_('order_' + tranid); }
 function markProcessed_(tranid) { props_().setProperty('order_' + tranid, String(new Date())); }
@@ -464,7 +470,7 @@ function doGet(e) {
       case 'ping': return jsonOut_({ ok: true, ts: String(new Date()) });
       // Разовая установка доступов в Script Properties (значения приходят параметрами).
       case 'setup': {
-        var keys = ['PARTNER_TOKEN', 'USER_TOKEN', 'COMPANY_ID', 'WRITEOFF_MASTER_ID', 'TILDA_CML_URL', 'TILDA_CML_LOGIN', 'TILDA_CML_PASS', 'TILDA_PRICE_ID', 'CONTROL_SHEET_ID', 'STORE_STORAGE_ID', 'LAST_SYNC_TS', 'ORDER_SEQ_NEXT'];
+        var keys = ['PARTNER_TOKEN', 'USER_TOKEN', 'COMPANY_ID', 'WRITEOFF_MASTER_ID', 'TILDA_CML_URL', 'TILDA_CML_LOGIN', 'TILDA_CML_PASS', 'TILDA_PRICE_ID', 'CONTROL_SHEET_ID', 'STORE_STORAGE_ID', 'LAST_SYNC_TS'];
         var set = [];
         keys.forEach(function (k) { if (p[k] != null && p[k] !== '') { props_().setProperty(k, String(p[k])); set.push(k); } });
         return jsonOut_({ ok: true, set: set });
@@ -516,7 +522,7 @@ function doGet(e) {
       case 'previewFeed': { var pi = String(p.goods || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean); var pg = fetchGoodsByIds_(pi); return jsonOut_({ ok: true, importXml: buildImportXml_(pg), offersXml: buildOffersXml_(pg) }); }
       // Наполнить master-список good_id (частями, чтобы не упереться в длину URL).
       case 'seedMaster': { var sm = String(p.ids || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean); addMasterIds_(sm); return jsonOut_({ ok: true, added: sm.length, total: masterIds_().length }); }
-      case 'master': return jsonOut_({ ok: true, masterCount: masterIds_().length, lastSync: prop_('LAST_SYNC_TS'), следующийНомерЗаказа: prop_('ORDER_SEQ_NEXT') || '(не задан → 1)' });
+      case 'master': return jsonOut_({ ok: true, masterCount: masterIds_().length, lastSync: prop_('LAST_SYNC_TS') });
       // Создать таблицу-журнал и запомнить её id.
       case 'createControl': { var cs = SpreadsheetApp.create('tilda-yclients — журнал интеграции'); props_().setProperty('CONTROL_SHEET_ID', cs.getId()); statusSheet_(); return jsonOut_({ ok: true, id: cs.getId(), url: cs.getUrl() }); }
       case 'installTriggers': return jsonOut_({ ok: true, triggers: installTriggers_() });
