@@ -60,9 +60,22 @@ function ycPost_(path, payload) {
 // 5xx (сбой на их стороне) — повторяем ТОЛЬКО для чтения (idempotent=true): повторить POST
 // создания операции опасно — она могла пройти, а ответ потеряться, и получится вторая продажа.
 // Ждём 3 → 9 → 20 секунд; дольше нельзя — у триггера Apps Script всего 6 минут на прогон.
+// Ограничитель СКОРОСТИ (не суточного объёма!). Лимит YClients — 5 запросов в СЕКУНДУ, и суточный
+// запас от него не спасает: опасны короткие всплески. Например приход накладной на 60 позиций
+// заставляет пятиминутку запросить 60 карточек подряд — без паузы это 8–10 запросов в секунду,
+// то есть выше потолка. Держим не чаще 4 запросов в секунду (пауза 250 мс между обращениями).
+var YC_MIN_GAP_MS_ = 250;
+var _ycLastCallAt_ = 0;
+function ycPace_() {
+  var wait = YC_MIN_GAP_MS_ - (new Date().getTime() - _ycLastCallAt_);
+  if (wait > 0) Utilities.sleep(wait);
+  _ycLastCallAt_ = new Date().getTime();
+}
+
 function ycFetch_(url, opts, idempotent) {
   var WAITS = [3000, 9000, 20000], resp = null;
   for (var i = 0; i <= WAITS.length; i++) {
+    ycPace_();
     resp = UrlFetchApp.fetch(url, opts);
     var code = resp.getResponseCode();
     var retryable = (code === 429) || (idempotent && code >= 500 && code < 600);
@@ -360,6 +373,12 @@ function pushCommerceML_(files) {
 // транзакции changed_after), шлём в Тильду только их. Нет изменений → ничего не шлём.
 function syncStockToTilda_() {
   var started = new Date();
+  // Не даём прогонам налезать друг на друга: раз в час пятиминутка совпадает с полной сверкой,
+  // и тогда к YClients и к Тильде идут ДВА потока запросов одновременно (всплеск + две
+  // параллельные сессии CommerceML). Ждём до 2 минут; не дождались — просто пропускаем,
+  // через 5 минут прогон повторится сам.
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(120000)) return;
   try { retryPending_(); } catch (e) { reportError_('Очередь повторов', e); }   // сначала добираем недолитое
   try {
     var d = changedGoodIdsNew_();                         // {ids, maxId} — новые складские операции по номеру
@@ -382,6 +401,8 @@ function syncStockToTilda_() {
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
   } catch (e) {
     reportError_('Обновление сайта (каждые 5 мин)', e);
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -455,6 +476,8 @@ function parseSeenTx_(str) {
 // ─── ПОЛНАЯ СВЕРКА (триггер раз в сутки, ночь): весь master-список остатков+цен → Тильда ──
 function syncFullToTilda_() {
   var started = new Date();
+  var lock = LockService.getScriptLock();          // не пересекаться с пятиминуткой (см. её комментарий)
+  if (!lock.tryLock(120000)) { logStatus_('Полная сверка сайта', 'ВНИМАНИЕ', 'пропущена: занят другой прогон', started); return; }
   try {
     // ДЕШЁВОЕ чтение: постраничный /goods (~7 запросов на 700 товаров) вместо 500 одиночных
     // запросов, как было раньше (из-за них сверка стоила дорого и жила только ночью).
@@ -480,6 +503,8 @@ function syncFullToTilda_() {
   } catch (e) {
     reportError_('Полная сверка сайта', e);
     throw e;
+  } finally {
+    lock.releaseLock();
   }
 }
 
