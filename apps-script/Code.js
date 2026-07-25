@@ -375,26 +375,6 @@ function doPost(e) {
   } catch (ignore) {}
   bumpHit_('HITS_POST');
   try {
-    // Вебхук подключён КО ВСЕМ формам сайта (решение Ирины 25.07) → сюда прилетают и обычные
-    // формы: обратная связь, подписки, отзывы. В них нет корзины — тихо игнорируем, без записей
-    // в журнал и без писем, чтобы не мусорить. «Корзинность» определяем по наличию полей
-    // корзины (payment/products), а не по составу: если корзина есть, а состав не распознан —
-    // это уже настоящая проблема, о ней сообщаем.
-    if (!isCartSubmission_(e)) {
-      bumpHit_('HITS_PLAIN_FORM');
-      // ⚠️ Отброшенное ЗАПОМИНАЕМ (поля + обрезанное тело). 25.07 этот фильтр молча съел
-      // настоящий заказ Ирины: у Тильды состав пришёл НЕ в payment/products. Без сохранения
-      // тела мы этого не увидели бы. Смотреть: ?action=lastSkipped
-      try {
-        props_().setProperties({
-          LAST_SKIPPED_AT: String(new Date()),
-          LAST_SKIPPED_FIELDS: payloadFields_(e).slice(0, 800),
-          LAST_SKIPPED_RAW: rawOrderPayload_(e).slice(0, 800)
-        });
-      } catch (ignore3) {}
-      return jsonOut_({ ok: true, skipped: 'не заказ (обычная форма)' });
-    }
-
     var order = parseTildaOrder_(e);
     // Не распознали заказ — НЕ молчим: в журнал + письмо, иначе заказ потеряется незаметно.
     if (!order.tranid) {
@@ -403,7 +383,10 @@ function doPost(e) {
       reportError_('Приём заказа с сайта', new Error('Не найден номер заказа (tranid). Тело: ' + rawNoId));
       return jsonOut_({ ok: false, error: 'no tranid' });
     }
-    // Корзина есть, а состав не распознан — это сигнал: формат полей мог измениться.
+    // Номер есть, а состав не распознан — сигнал: поля вебхука не те, что мы ждём.
+    // Тело запроса пишем в журнал и в письмо — по нему сразу видно реальный формат Тильды.
+    // (Фильтра «обычная форма» больше нет: вебхук подключён ТОЛЬКО к корзине, решение Ирины
+    // 25.07 — «применить ко всем формам» она не нажимала. Значит всё, что приходит, — заказ.)
     if (!order.items.length) {
       logStatus_('Заказ с сайта', 'ВНИМАНИЕ', '#' + order.tranid + ' без состава; тело: ' + rawOrderPayload_(e), new Date());
       reportError_('Заказ с сайта №' + order.tranid, new Error('Заказ пришёл, но состав не распознан. Тело: ' + rawOrderPayload_(e)));
@@ -449,21 +432,6 @@ function bumpHit_(key) {
     props_().setProperty(key, String(n));
     props_().setProperty(key + '_LAST', String(new Date()));
   } catch (ignore) {}
-}
-
-// Это отправка КОРЗИНЫ (заказ) или обычная форма? Признак — поля корзины: payment / products.
-// Обычные формы сайта (обратная связь, подписка, отзыв) их не содержат.
-function isCartSubmission_(e) {
-  try {
-    var p = (e && e.parameter) || {};
-    if (p.payment || p.products) return true;
-    var raw = e && e.postData && e.postData.contents;
-    if (raw && String(raw).trim().charAt(0) === '{') {
-      var b = JSON.parse(raw) || {};
-      if (b.payment || b.products) return true;
-    }
-    return false;
-  } catch (ignore) { return true; }   // сомневаемся — считаем заказом, лучше лишняя запись, чем потерянный заказ
 }
 
 // Имена полей вебхука + значения «номерных» полей, без персональных данных клиента.
@@ -564,9 +532,6 @@ function doGet(e) {
         }
         return jsonOut_({ ok: true, удалено: delN, осталось: shN.getLastRow() - 1 });
       }
-      // Что именно было отброшено фильтром «не заказ» — поля и тело последнего такого запроса.
-      case 'lastSkipped': return jsonOut_({ ok: true, когда: prop_('LAST_SKIPPED_AT') || '—',
-        поля: prop_('LAST_SKIPPED_FIELDS') || '—', тело: prop_('LAST_SKIPPED_RAW') || '—' });
       // Какие заказы приёмник считает обработанными (ключи идемпотентности). Только чтение.
       case 'orderKeys': {
         var allK = props_().getProperties(), rowsK = [];
@@ -619,8 +584,7 @@ function doGet(e) {
       case 'master': return jsonOut_({ ok: true, masterCount: masterIds_().length, lastSync: prop_('LAST_SYNC_TS'),
         обращенийPOST: prop_('HITS_POST') || 0, последнийPOST: prop_('HITS_POST_LAST') || '—',
         отказовGET: prop_('HITS_GET_DENIED') || 0, последнийОтказGET: prop_('HITS_GET_DENIED_LAST') || '—',
-        проверокТильды: prop_('HITS_TILDA_TEST') || 0, последняяПроверкаТильды: prop_('HITS_TILDA_TEST_LAST') || '—',
-        обычныхФорм: prop_('HITS_PLAIN_FORM') || 0 });
+        проверокТильды: prop_('HITS_TILDA_TEST') || 0, последняяПроверкаТильды: prop_('HITS_TILDA_TEST_LAST') || '—' });
       // Создать таблицу-журнал и запомнить её id.
       case 'createControl': { var cs = SpreadsheetApp.create('tilda-yclients — журнал интеграции'); props_().setProperty('CONTROL_SHEET_ID', cs.getId()); statusSheet_(); return jsonOut_({ ok: true, id: cs.getId(), url: cs.getUrl() }); }
       case 'installTriggers': return jsonOut_({ ok: true, triggers: installTriggers_() });
