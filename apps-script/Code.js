@@ -349,7 +349,17 @@ function pushFeed_(goods) {
 function doPost(e) {
   try {
     var order = parseTildaOrder_(e);
-    if (!order.tranid) return jsonOut_({ ok: false, error: 'no tranid' });
+    // Не распознали заказ — НЕ молчим: в журнал + письмо, иначе заказ потеряется незаметно.
+    if (!order.tranid) {
+      var rawNoId = rawOrderPayload_(e);
+      logStatus_('Заказ Тильды', 'ОШИБКА', 'не найден номер заказа; тело: ' + rawNoId, new Date());
+      reportError_('Приём заказа Тильды', new Error('Не найден номер заказа (tranid). Тело: ' + rawNoId));
+      return jsonOut_({ ok: false, error: 'no tranid' });
+    }
+    // Номер есть, но состава нет — тоже сигнал (формат полей мог измениться).
+    if (!order.items.length) {
+      logStatus_('Заказ Тильды', 'ВНИМАНИЕ', '#' + order.tranid + ' без состава; тело: ' + rawOrderPayload_(e), new Date());
+    }
     if (isProcessed_(order.tranid)) return jsonOut_({ ok: true, dup: true });   // идемпотентность
 
     // externalid позиции Тильды = '_' + good_id → good_id получаем напрямую, без справочника.
@@ -374,22 +384,48 @@ function doPost(e) {
   }
 }
 
-// ⚠️ TODO(боевая проверка): точные имена полей вебхука Тильды — снять тестовым заказом.
-// Заготовка: form-urlencoded, состав заказа массивом + externalid + количество.
+// Разбор вебхука заказа Тильды. Поддерживаем ОБА формата, т.к. Тильда может присылать и
+// form-urlencoded (поля в e.parameter, состав — JSON-строкой в payment), и JSON-тело
+// (e.postData.contents). Проверено 25.07: form-urlencoded работает; JSON — заложен, чтобы
+// заказ не потерялся молча, если Тильда пришлёт его телом.
 function parseTildaOrder_(e) {
   var p = (e && e.parameter) || {};
-  var tranid = p.tranid || p.orderid || '';
-  var items = [];
-  // Вариант 1: JSON в поле payment/products (уточнить на боевом).
+  var body = {};
   try {
-    if (p.payment) {
-      var pay = JSON.parse(p.payment);
-      (pay.products || []).forEach(function (pr) {
-        items.push({ name: pr.name, externalid: pr.externalid || pr.sku, sku: pr.sku, quantity: Number(pr.quantity) || 1 });
-      });
-    }
+    var raw = e && e.postData && e.postData.contents;
+    if (raw && String(raw).trim().charAt(0) === '{') body = JSON.parse(raw) || {};
   } catch (ignore) {}
+
+  function pick(k) { return (p[k] != null && p[k] !== '') ? p[k] : body[k]; }
+  var tranid = pick('tranid') || pick('orderid') || pick('order_id') || pick('systranid') || '';
+
+  // Состав заказа: payment.products (у Тильды — JSON-строка в form-поле или объект в теле),
+  // либо products на верхнем уровне.
+  var pay = pick('payment');
+  if (typeof pay === 'string') { try { pay = JSON.parse(pay); } catch (ignore) { pay = null; } }
+  var products = (pay && pay.products) || body.products || p.products || null;
+  if (typeof products === 'string') { try { products = JSON.parse(products); } catch (ignore) { products = null; } }
+
+  var items = [];
+  if (products && products.length) {
+    products.forEach(function (pr) {
+      items.push({
+        name: pr.name || pr.title || '',
+        externalid: pr.externalid || pr.externalId || pr.sku,
+        sku: pr.sku,
+        quantity: Number(pr.quantity || pr.amount || 1) || 1
+      });
+    });
+  }
   return { tranid: String(tranid), items: items };
+}
+
+// Сырое тело/поля вебхука — для журнала, когда заказ не распознан (обрезаем: там ПД клиента).
+function rawOrderPayload_(e) {
+  var out = '';
+  try { out = (e && e.postData && e.postData.contents) || ''; } catch (ignore) {}
+  if (!out) { try { out = JSON.stringify((e && e.parameter) || {}); } catch (ignore) { out = '?'; } }
+  return String(out).slice(0, 900);
 }
 
 // ─── Идемпотентность обработанных заказов ─────────────────────────────────────
