@@ -167,7 +167,40 @@ function createOnlineSale_(items, comment) {
       };
     })
   };
-  return ycPost_('/storage_operations/operation/' + companyId_(), payload);
+  var res = ycPost_('/storage_operations/operation/' + companyId_(), payload);
+
+  // ⚠️ YClients ИГНОРИРУЕТ comment при СОЗДАНИИ операции (проверено на боевом 25.07: документ
+  // создаётся с comment=""). Комментарий проставляется отдельным PUT по документу, и в нём
+  // ОБЯЗАТЕЛЬНЫ type_id, storage_id и create_date с ПОЛНЫМ временем (только дата → 400).
+  // Ошибку тут не роняем: списание уже создано, важнее не потерять его из-за подписи.
+  try {
+    var docId = (res && res.data && (res.data.document_id || (res.data.document || {}).id)) || null;
+    if (docId) setDocumentComment_(docId, payload.comment);
+    else logStatus_('Заказ с сайта', 'ВНИМАНИЕ', 'не нашёл id документа для комментария', new Date());
+  } catch (e) {
+    logStatus_('Заказ с сайта', 'ВНИМАНИЕ', 'операция создана, комментарий не проставлен: ' +
+      String(e && e.message || e).slice(0, 150), new Date());
+  }
+  return res;
+}
+
+// Проставляет комментарий существующему складскому документу (см. пояснение выше).
+function setDocumentComment_(docId, text) {
+  var path = '/storage_operations/documents/' + companyId_() + '/' + docId;
+  var cur = ycGet_(path), d = (cur && cur.data) || {};
+  var resp = UrlFetchApp.fetch(YC_BASE_ + path, {
+    method: 'put', headers: ycHeaders_(), muteHttpExceptions: true,
+    payload: JSON.stringify({
+      comment: text,
+      type_id: d.type_id,
+      storage_id: d.storage_id,
+      create_date: d.create_date        // полное «ГГГГ-ММ-ДД ЧЧ:ММ:СС», иначе 400
+    })
+  });
+  if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
+    throw new Error('PUT комментария → HTTP ' + resp.getResponseCode() + ': ' + resp.getContentText().slice(0, 200));
+  }
+  return true;
 }
 
 // ─── Поток A: сборка CommerceML-фида и заливка в Тильду ────────────────────────
