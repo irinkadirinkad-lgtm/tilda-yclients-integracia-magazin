@@ -185,7 +185,7 @@ function createOnlineSale_(items, comment) {
       });
       added++;
     } catch (e) {
-      failed.push(it.good_id + ': ' + String(e && e.message || e).slice(0, 120));
+      failed.push({ good_id: it.good_id, amount: it.amount, error: String(e && e.message || e).slice(0, 200) });
     }
   });
 
@@ -197,11 +197,11 @@ function createOnlineSale_(items, comment) {
   }
 
   if (failed.length) {
-    // Часть позиций не легла — это НАДО заметить: остаток спишется не полностью.
-    logStatus_('Заказ с сайта', 'ОШИБКА', 'документ ' + docId + ', не добавлены позиции: ' +
-      failed.join(' | '), new Date());
-    reportError_('Заказ с сайта: позиции не добавлены',
-      new Error('Документ ' + docId + '. ' + failed.join(' | ')));
+    // Часть позиций не легла — НЕ теряем: ставим в очередь повторов (её разбирает пятиминутка),
+    // плюс сразу пишем в журнал. Иначе остаток списался бы не полностью и незаметно.
+    failed.forEach(function (f) { queueRetry_(docId, f.good_id, f.amount, text, f.error); });
+    logStatus_('Заказ с сайта', 'ОШИБКА', 'документ ' + docId + ', в очередь повторов: ' +
+      failed.map(function (f) { return f.good_id; }).join(', '), new Date());
   }
   return { document_id: docId, добавлено: added, неудачных: failed.length };
 }
@@ -329,6 +329,7 @@ function pushCommerceML_(files) {
 // транзакции changed_after), шлём в Тильду только их. Нет изменений → ничего не шлём.
 function syncStockToTilda_() {
   var started = new Date();
+  try { retryPending_(); } catch (e) { reportError_('Очередь повторов', e); }   // сначала добираем недолитое
   try {
     var d = changedGoodIdsNew_();                         // {ids, maxId} — новые складские операции по номеру
     if (d.ids.length) {
@@ -623,6 +624,73 @@ function rawOrderPayload_(e) {
   return String(out).slice(0, 2000);   // 900 не хватало: русские поля Тильды уходили за обрез
 }
 
+// ─── Очередь повторов: позиции, которые не легли в документ ───────────────────
+// Зачем: операция создаётся поэтапно (документ → позиции), и если позиция не добавилась,
+// остаток спишется не полностью. Молча терять нельзя — кладём в лист «Очередь повторов»,
+// пятиминутка добирает. После MAX_RETRY попыток — письмо Ирине и статус «не удалось».
+var MAX_RETRY_ = 5;
+
+function retrySheet_() {
+  var ss = SpreadsheetApp.openById(requireProp_('CONTROL_SHEET_ID'));
+  var sh = ss.getSheetByName('Очередь повторов');
+  if (!sh) {
+    sh = ss.insertSheet('Очередь повторов');
+    sh.appendRow(['Дата', 'Документ', 'good_id', 'Кол-во', 'Комментарий', 'Попыток', 'Статус', 'Последняя ошибка']);
+  }
+  return sh;
+}
+
+function queueRetry_(docId, goodId, amount, comment, error) {
+  try {
+    retrySheet_().appendRow([new Date(), docId, goodId, amount, comment, 0, 'ждёт', String(error || '').slice(0, 300)]);
+  } catch (e) {
+    // Даже если лист недоступен — не теряем сигнал.
+    sendErrorEmail_('Не удалось поставить позицию в очередь повторов',
+      'Документ ' + docId + ', товар ' + goodId + ', кол-во ' + amount + '. Ошибка: ' + error);
+  }
+}
+
+// Разбирает очередь. Вызывается пятиминуткой; можно и вручную (?action=retryNow).
+function retryPending_() {
+  var sh, vals;
+  try { sh = retrySheet_(); vals = sh.getDataRange().getValues(); }
+  catch (e) { return { ошибка: String(e && e.message || e) }; }
+  var master = Number(requireProp_('WRITEOFF_MASTER_ID'));
+  var done = 0, still = 0, dead = 0;
+  for (var r = 1; r < vals.length; r++) {
+    if (String(vals[r][6]) !== 'ждёт') continue;
+    var docId = vals[r][1], goodId = vals[r][2], amount = Number(vals[r][3]) || 1;
+    var comment = String(vals[r][4] || ''), tries = Number(vals[r][5]) || 0;
+    try {
+      ycPost_('/storage_operations/goods_transactions/' + companyId_(), {
+        document_id: Number(docId), good_id: Number(goodId), amount: amount,
+        cost_per_unit: 0, discount: 0, cost: 0, operation_unit_type: 1,
+        master_id: master, comment: comment
+      });
+      sh.getRange(r + 1, 6, 1, 3).setValues([[tries + 1, 'готово', '']]);
+      done++;
+    } catch (e) {
+      var msg = String(e && e.message || e).slice(0, 300);
+      if (tries + 1 >= MAX_RETRY_) {
+        sh.getRange(r + 1, 6, 1, 3).setValues([[tries + 1, 'не удалось', msg]]);
+        sendErrorEmail_('Позиция заказа так и не списалась',
+          'Документ ' + docId + ', товар ' + goodId + ', кол-во ' + amount +
+          '. Попыток: ' + (tries + 1) + '. Последняя ошибка: ' + msg +
+          '\n\nНужно добавить товар в эту операцию вручную в YClients.');
+        dead++;
+      } else {
+        sh.getRange(r + 1, 6, 1, 3).setValues([[tries + 1, 'ждёт', msg]]);
+        still++;
+      }
+    }
+  }
+  if (done || dead) {
+    logStatus_('Очередь повторов', dead ? 'ОШИБКА' : 'OK',
+      'долито: ' + done + ', ещё ждут: ' + still + ', не удалось: ' + dead, new Date());
+  }
+  return { долито: done, ждут: still, неУдалось: dead };
+}
+
 // ─── Сквозная нумерация заказов (нумерация Ирины) ─────────────────────────────
 // ORDER_SEQ_NEXT = номер, который получит СЛЕДУЮЩИЙ заказ. Задаётся через
 // ?action=setup&ORDER_SEQ_NEXT=<n>, виден в ?action=master. Расходуется только когда есть что
@@ -672,6 +740,7 @@ function doGet(e) {
         }
         return jsonOut_({ ok: true, удалено: delN, осталось: shN.getLastRow() - 1 });
       }
+      case 'retryNow': return jsonOut_({ ok: true, результат: retryPending_() });
       // Какие листы есть в журнал-таблице и сколько в них строк.
       case 'sheets': {
         var ss = SpreadsheetApp.openById(requireProp_('CONTROL_SHEET_ID'));
