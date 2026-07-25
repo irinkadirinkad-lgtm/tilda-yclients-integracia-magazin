@@ -420,7 +420,15 @@ function doGet(e) {
       }
       case 'storages': return jsonOut_({ ok: true, data: ycGet_('/storages/' + companyId_()).data });
       case 'storeStorageId': return jsonOut_({ ok: true, storeStorageId: resolveStoreStorageId_() });
-      case 'goods': { var g = fetchStoreGoods_(); return jsonOut_({ ok: true, count: g.length, sample: g.slice(0, 20) }); }
+      // Без параметров — как раньше (первые 20). Фильтры для диагностики:
+      // minAmount — только с остатком >= N; minPrice — только с ценой >= N; sort=price — по возрастанию цены; limit — сколько отдать.
+      case 'goods': {
+        var g = fetchStoreGoods_();
+        var minAmt = Number(p.minAmount || 0), minPrice = Number(p.minPrice || 0), lim = Number(p.limit || 20);
+        var list = g.filter(function (x) { return x.amount >= minAmt && x.price >= minPrice; });
+        if (p.sort === 'price') list.sort(function (a, b) { return a.price - b.price; });
+        return jsonOut_({ ok: true, count: g.length, matched: list.length, sample: list.slice(0, lim) });
+      }
       // Точечный тест обмена: заливает в Тильду ТОЛЬКО указанные good_id (через запятую). Для контроля «обновляет, не двоит».
       case 'testFeed': { var ids = String(p.goods || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean); var gs = fetchGoodsByIds_(ids); var r = gs.length ? pushFeed_(gs) : 'нет товаров'; return jsonOut_({ ok: true, pushed: gs.length, skipped: gs._skipped || [], result: r }); }
       // Показать сформированный XML без заливки (для проверки формата).
