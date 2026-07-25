@@ -232,9 +232,19 @@ function pushCommerceML_(files) {
   var base = requireProp_('TILDA_CML_URL');
   var auth = 'Basic ' + Utilities.base64Encode(requireProp_('TILDA_CML_LOGIN') + ':' + requireProp_('TILDA_CML_PASS'));
   // 1. checkauth → success\n{cookieName}\n{cookieValue}
-  var r = UrlFetchApp.fetch(base + '?type=catalog&mode=checkauth', { headers: { Authorization: auth }, muteHttpExceptions: true });
-  var lines = r.getContentText().split(/\r?\n/);
-  if (lines[0] !== 'success') throw new Error('Tilda checkauth: ' + r.getContentText().slice(0, 200));
+  // ⚠️ У Тильды есть ограничение частоты («Many requests. Please try again later»).
+  // Прежняя версия сверки тянула товары по одному и потому невольно делала паузы; когда чтение
+  // ускорили, заливки пошли подряд и упёрлись в лимит (25.07). Поэтому — повтор с ожиданием.
+  var r = null, lines = null;
+  for (var att = 1; att <= 4; att++) {
+    r = UrlFetchApp.fetch(base + '?type=catalog&mode=checkauth', { headers: { Authorization: auth }, muteHttpExceptions: true });
+    lines = r.getContentText().split(/\r?\n/);
+    if (lines[0] === 'success') break;
+    if (att === 4 || r.getContentText().toLowerCase().indexOf('many request') === -1) {
+      throw new Error('Tilda checkauth: ' + r.getContentText().slice(0, 200));
+    }
+    Utilities.sleep(att * 10000);            // 10 с, 20 с, 30 с
+  }
   var cookie = lines[1] + '=' + lines[2];
   var setc = r.getAllHeaders()['Set-Cookie'];
   if (setc) (Array.isArray(setc) ? setc : [setc]).forEach(function (c) { cookie += '; ' + String(c).split(';')[0]; });
@@ -322,17 +332,30 @@ function changedGoodIdsNew_() {
 function syncFullToTilda_() {
   var started = new Date();
   try {
+    // ДЕШЁВОЕ чтение: постраничный /goods (~7 запросов на 700 товаров) вместо 500 одиночных
+    // запросов, как было раньше (из-за них сверка стоила дорого и жила только ночью).
+    // Набор товаров тот же — master-список; отправляем партиями, чтобы XML не был огромным.
     var ids = masterIds_();
     if (!ids.length) { logStatus_('Полная сверка A', 'OK', 'master пуст', started); return; }
-    var pushed = 0;
-    for (var i = 0; i < ids.length; i += 50) {           // партиями по 50, чтобы уложиться в лимиты
-      var goods = fetchGoodsByIds_(ids.slice(i, i + 50));
-      if (goods.length) { pushFeed_(goods); pushed += goods.length; }
+    var want = {}; ids.forEach(function (x) { want[String(x)] = 1; });
+
+    var all = fetchStoreGoods_();
+    var goods = all.filter(function (g) { return want[String(g.good_id)]; });
+
+    var pushed = 0, batches = 0, SIZE = 250;   // крупные партии = меньше обращений к Тильде
+    for (var i = 0; i < goods.length; i += SIZE) {
+      if (i > 0) Utilities.sleep(8000);         // пауза между партиями — не упираться в лимит частоты
+      pushFeed_(goods.slice(i, i + SIZE));
+      pushed += Math.min(SIZE, goods.length - i);
+      batches++;
     }
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
-    logStatus_('Полная сверка A (ночь)', 'OK', 'сверено товаров: ' + pushed + ' из ' + ids.length, started);
+    logStatus_('Полная сверка A', 'OK', 'сверено товаров: ' + pushed + ' из ' + ids.length +
+      ' (в каталоге ' + all.length + '), партий: ' + batches, started);
+    return { сверено: pushed, вMaster: ids.length, вКаталоге: all.length, партий: batches };
   } catch (e) {
-    reportError_('Полная сверка A (ночь)', e);
+    reportError_('Полная сверка A', e);
+    throw e;
   }
 }
 
@@ -633,7 +656,7 @@ function doGet(e) {
       case 'changedNew': { var cn = changedGoodIdsNew_(); return jsonOut_({ ok: true, count: cn.ids.length, maxId: cn.maxId, lastTxId: prop_('LAST_TX_ID') }); }
       case 'primeTx': { var pt = changedGoodIdsNew_(); props_().setProperty('LAST_TX_ID', String(pt.maxId)); return jsonOut_({ ok: true, primedTo: pt.maxId }); }
       case 'runInc': syncStockToTilda_(); return jsonOut_({ ok: true, lastSync: prop_('LAST_SYNC_TS') });
-      case 'runFull': syncFullToTilda_(); return jsonOut_({ ok: true, lastSync: prop_('LAST_SYNC_TS') });
+      case 'runFull': { var rf = syncFullToTilda_(); return jsonOut_({ ok: true, результат: rf, lastSync: prop_('LAST_SYNC_TS') }); }
       // Боевой тест списания: спишет 1 шт товара good_id и НЕ должен создать финоперацию.
       case 'testWriteOff': return jsonOut_({ ok: true, result: createOnlineSale_([{ good_id: p.good_id, amount: 1 }], 'ТЕСТ списания (проверка 0 к оплате)') });
       // Гибкий тест: любой type_id (1=продажа, 4=списание) + unit_type, всё по нулям.
