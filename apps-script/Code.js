@@ -149,46 +149,61 @@ function fetchGoodsByIds_(ids) {
 // items: [{good_id, amount}]. Возвращает документ-ответ YClients.
 function createOnlineSale_(items, comment) {
   var master = Number(requireProp_('WRITEOFF_MASTER_ID'));
-  var payload = {
-    type_id: 1,                       // 1 = продажа товара
-    storage_id: Number(resolveStoreStorageId_()),
+  var storage = Number(resolveStoreStorageId_());
+  var text = comment || "Заказ с интернет-магазина EL'NATUREL SHOP";
+
+  // ⚠️ ПОЧЕМУ В ДВА ЭТАПА (выяснено на боевом 25.07, важно не «упростить» обратно):
+  // в комбинированном запросе (документ + позиции сразу) YClients ТЕРЯЕТ комментарий позиции,
+  // а именно он показывается в СПИСКЕ складских операций — там, где Ирина просматривает продажи.
+  // Поэтому: сначала создаём ПУСТОЙ документ (остатки не двигаются), затем добавляем позиции
+  // отдельным эндпоинтом, где `comment` сохраняется (проверено: позиция получила подпись).
+  // Комментарий самого документа (виден в КАРТОЧКЕ) ставится третьим шагом, PUT-ом.
+  var doc = ycPost_('/storage_operations/operation/' + companyId_(), {
+    type_id: 1,                        // 1 = продажа товара
+    storage_id: storage,
     master_id: master,
     create_date: formatDate_(new Date()),
-    comment: comment || "Заказ с интернет-магазина EL'NATUREL SHOP",
-    goods_transactions: items.map(function (it) {
-      return {
+    comment: text,
+    goods_transactions: []
+  });
+  var docId = (doc && doc.data && (doc.data.document_id || (doc.data.document || {}).id)) || null;
+  if (!docId) throw new Error('YClients не вернул id документа: ' + JSON.stringify(doc).slice(0, 300));
+
+  var added = 0, failed = [];
+  items.forEach(function (it) {
+    try {
+      ycPost_('/storage_operations/goods_transactions/' + companyId_(), {
+        document_id: Number(docId),
         good_id: Number(it.good_id),
         amount: Number(it.amount),
         cost_per_unit: 0,
         discount: 0,
         cost: 0,
-        operation_unit_type: 1,       // 1 = продажа
+        operation_unit_type: 1,        // 1 = продажа
         master_id: master,
-        // ⚠️ КОММЕНТАРИЙ НУЖЕН В ДВУХ МЕСТАХ (выяснено на боевом 25.07 по скриншотам Ирины):
-        //   • здесь, в ПОЗИЦИИ операции → его показывает СПИСОК складских операций (колонка
-        //     «Комментарий»), по которому Ирина и просматривает операции;
-        //   • на ДОКУМЕНТЕ (отдельный PUT ниже) → его показывает КАРТОЧКА операции.
-        // Ловушка: `GET /storages/transactions` комментарий позиции НЕ возвращает (всегда ""),
-        // поэтому по API кажется, будто он не сохранился. Не верить этому и не удалять!
-        comment: comment || ''
-      };
-    })
-  };
-  var res = ycPost_('/storage_operations/operation/' + companyId_(), payload);
+        comment: text                  // ← ЭТО и видно в списке операций
+      });
+      added++;
+    } catch (e) {
+      failed.push(it.good_id + ': ' + String(e && e.message || e).slice(0, 120));
+    }
+  });
 
-  // ⚠️ YClients ИГНОРИРУЕТ comment при СОЗДАНИИ операции (проверено на боевом 25.07: документ
-  // создаётся с comment=""). Комментарий проставляется отдельным PUT по документу, и в нём
-  // ОБЯЗАТЕЛЬНЫ type_id, storage_id и create_date с ПОЛНЫМ временем (только дата → 400).
-  // Ошибку тут не роняем: списание уже создано, важнее не потерять его из-за подписи.
-  try {
-    var docId = (res && res.data && (res.data.document_id || (res.data.document || {}).id)) || null;
-    if (docId) setDocumentComment_(docId, payload.comment);
-    else logStatus_('Заказ с сайта', 'ВНИМАНИЕ', 'не нашёл id документа для комментария', new Date());
-  } catch (e) {
-    logStatus_('Заказ с сайта', 'ВНИМАНИЕ', 'операция создана, комментарий не проставлен: ' +
+  // Комментарий документа — для карточки операции. Ошибку не роняем: списание уже создано.
+  try { setDocumentComment_(docId, text); }
+  catch (e) {
+    logStatus_('Заказ с сайта', 'ВНИМАНИЕ', 'подпись документа не проставлена: ' +
       String(e && e.message || e).slice(0, 150), new Date());
   }
-  return res;
+
+  if (failed.length) {
+    // Часть позиций не легла — это НАДО заметить: остаток спишется не полностью.
+    logStatus_('Заказ с сайта', 'ОШИБКА', 'документ ' + docId + ', не добавлены позиции: ' +
+      failed.join(' | '), new Date());
+    reportError_('Заказ с сайта: позиции не добавлены',
+      new Error('Документ ' + docId + '. ' + failed.join(' | ')));
+  }
+  return { document_id: docId, добавлено: added, неудачных: failed.length };
 }
 
 // Проставляет комментарий существующему складскому документу (см. пояснение выше).
@@ -670,7 +685,7 @@ function doGet(e) {
         var d = String(p.date || formatDate_(new Date()).slice(0, 10));
         var tx = ycGet_('/storages/transactions/' + companyId_(), { start_date: d, end_date: d, count: 1000 });
         var fin = ycGet_('/transactions/' + companyId_(), { start_date: d, end_date: d, count: 200 });
-        var docCache = {};
+        var docCache = {}, txCache = {};
         function docComment(id) {
           if (docCache[id] === undefined) {
             try { docCache[id] = ((ycGet_('/storage_operations/documents/' + companyId_() + '/' + id).data) || {}).comment; }
@@ -678,11 +693,23 @@ function doGet(e) {
           }
           return docCache[id];
         }
+        // ⚠️ Комментарий ПОЗИЦИИ (тот, что виден в СПИСКЕ операций) отдаёт только этот эндпоинт;
+        // `/storages/transactions` его всегда возвращает пустым — на этом легко обмануться.
+        function txComment(id, txId) {
+          if (txCache[id] === undefined) {
+            txCache[id] = {};
+            try {
+              (((ycGet_('/storage_operations/operation/' + companyId_() + '/' + id).data) || {}).goods_transactions || [])
+                .forEach(function (t) { txCache[id][t.id] = t.comment; });
+            } catch (er) {}
+          }
+          return txCache[id][txId];
+        }
         return jsonOut_({ ok: true, дата: d,
           складские: ((tx && tx.data) || []).map(function (t) {
             return { документ: t.document_id, тип: t.type, кол: t.amount, сумма: t.cost,
                      товар: (t.good || {}).title,
-                     комментарийОперации: t.comment, комментарийДокумента: docComment(t.document_id),
+                     комментарийПозиции: txComment(t.document_id, t.id), комментарийДокумента: docComment(t.document_id),
                      время: t.create_date };
           }),
           финансовые: ((fin && fin.data) || []).map(function (f) {
