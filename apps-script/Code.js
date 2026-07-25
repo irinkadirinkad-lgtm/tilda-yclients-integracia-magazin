@@ -348,6 +348,18 @@ function pushFeed_(goods) {
 // ─── Поток B: приём заказа Тильды ──────────────────────────────────────────────
 function doPost(e) {
   bumpHit_('HITS_POST');
+  // ⚠️ КРИТИЧНО. При сохранении вебхука Тильда сама шлёт проверочный запрос test=test и ждёт
+  // ответ 200 в течение 5 СЕКУНД. Не ответим вовремя — вебхук не активируется и заказы
+  // не приходят вообще (именно на это мы потеряли время 25.07). Поэтому на проверку отвечаем
+  // МГНОВЕННО: ни таблицы, ни почты, ни запросов к YClients. Факт проверки — в Script Property.
+  try {
+    var pt = (e && e.parameter) || {};
+    var rawT = (e && e.postData && e.postData.contents) || '';
+    if (pt.test === 'test' || String(rawT).indexOf('test=test') !== -1) {
+      bumpHit_('HITS_TILDA_TEST');
+      return jsonOut_({ ok: true, test: true });
+    }
+  } catch (ignore) {}
   try {
     var order = parseTildaOrder_(e);
     // Не распознали заказ — НЕ молчим: в журнал + письмо, иначе заказ потеряется незаметно.
@@ -505,7 +517,9 @@ function doGet(e) {
       // Чистка следов тестов: ключи идемпотентности и строки журнала с тестовыми маркерами.
       // Правило Ирины: после тестов история должна быть чистой. Удалить вместе с остальным люком.
       case 'cleanupTests': {
-        var MARK = /TEST|PROBE|PROD-|CHECK/i;
+        // Узкие маркеры МОИХ тестов. ⚠️ Не ловить слово «test» вообще: проверочный запрос
+        // Тильды выглядит как test=test, и широкий шаблон стирал следы её проверки.
+        var MARK = /TEST-|PROBE|PROD-|CHECK-/i;
         var allProps = props_().getProperties(), delKeys = [];
         Object.keys(allProps).forEach(function (k) {
           if (k.indexOf('order_') === 0 && MARK.test(k)) { props_().deleteProperty(k); delKeys.push(k); }
@@ -535,7 +549,8 @@ function doGet(e) {
       case 'seedMaster': { var sm = String(p.ids || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean); addMasterIds_(sm); return jsonOut_({ ok: true, added: sm.length, total: masterIds_().length }); }
       case 'master': return jsonOut_({ ok: true, masterCount: masterIds_().length, lastSync: prop_('LAST_SYNC_TS'),
         обращенийPOST: prop_('HITS_POST') || 0, последнийPOST: prop_('HITS_POST_LAST') || '—',
-        отказовGET: prop_('HITS_GET_DENIED') || 0, последнийОтказGET: prop_('HITS_GET_DENIED_LAST') || '—' });
+        отказовGET: prop_('HITS_GET_DENIED') || 0, последнийОтказGET: prop_('HITS_GET_DENIED_LAST') || '—',
+        проверокТильды: prop_('HITS_TILDA_TEST') || 0, последняяПроверкаТильды: prop_('HITS_TILDA_TEST_LAST') || '—' });
       // Создать таблицу-журнал и запомнить её id.
       case 'createControl': { var cs = SpreadsheetApp.create('tilda-yclients — журнал интеграции'); props_().setProperty('CONTROL_SHEET_ID', cs.getId()); statusSheet_(); return jsonOut_({ ok: true, id: cs.getId(), url: cs.getUrl() }); }
       case 'installTriggers': return jsonOut_({ ok: true, triggers: installTriggers_() });
