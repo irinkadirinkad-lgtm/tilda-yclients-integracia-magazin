@@ -362,7 +362,6 @@ function syncStockToTilda_() {
         logStatus_('Обновление сайта', 'OK', 'автоматика работает, изменений нет (отметка раз в сутки)', started);
       }
     }
-    if (d.maxId) props_().setProperty('LAST_TX_ID', String(d.maxId));   // сдвигаем только после успешной заливки
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
   } catch (e) {
     reportError_('Обновление сайта (каждые 5 мин)', e);
@@ -373,12 +372,13 @@ function syncStockToTilda_() {
 // не работает). Окно — вчера+сегодня (перехлёст на полночь). Возвращает {ids: [good_id...], maxId}.
 function changedGoodIdsNew_() {
   var storageId = String(resolveStoreStorageId_());
-  var lastId = Number(prop_('LAST_TX_ID') || 0);
   var now = new Date();
-  var d1 = formatDate_(new Date(now.getTime() - 24 * 3600 * 1000)).slice(0, 10);
+  // Окно — 3 суток: этого хватает, чтобы заметить удаление вчерашнего заказа. Более старое
+  // выправит ночная полная сверка.
+  var d1 = formatDate_(new Date(now.getTime() - 3 * 24 * 3600 * 1000)).slice(0, 10);
   var d2 = formatDate_(now).slice(0, 10);
   var rows = [], page = 1;
-  while (page <= 20) {                                    // подстраховка от пагинации
+  while (page <= 20) {
     var res = ycGet_('/storages/transactions/' + companyId_(), { start_date: d1, end_date: d2, count: 1000, page: page });
     var r = (res && res.data) || [];
     if (!r.length) break;
@@ -386,16 +386,53 @@ function changedGoodIdsNew_() {
     if (r.length < 1000) break;
     page++;
   }
-  var maxId = lastId, set = {};
+
+  // ⚠️ ПОЧЕМУ СРАВНИВАЕМ СПИСКИ, А НЕ ТОЛЬКО НОМЕРА (найдено 25.07 по наблюдению Ирины):
+  // раньше искали только НОВЫЕ операции (id > LAST_TX_ID) — и не замечали УДАЛЕНИЕ: удалённая
+  // операция просто исчезает, нового номера не появляется. Из-за этого после отмены заказа
+  // остаток в YClients возвращался, а на сайте оставался заниженным до ночной сверки.
+  // Теперь помним прошлый список «номер операции → товар» и берём и появившиеся, и исчезнувшие.
+  // Дополнительных запросов это НЕ требует: список уже пришёл тем же единственным запросом.
+  var cur = {}, set = {};
   rows.forEach(function (t) {
-    var id = Number(t.id) || 0;
-    if (id > maxId) maxId = id;
-    if (id > lastId) {
-      var g = t.good || {};
-      if (g.id && (t.storage_id == null || String(t.storage_id) === storageId)) set[g.id] = 1;
-    }
+    var id = Number(t.id) || 0, g = t.good || {};
+    if (!id || !g.id) return;
+    if (t.storage_id != null && String(t.storage_id) !== storageId) return;
+    cur[id] = g.id;
   });
-  return { ids: Object.keys(set), maxId: maxId };
+
+  var prev = parseSeenTx_(prop_('TX_SEEN'));
+  var first = !prop_('TX_SEEN');
+  if (!first) {
+    Object.keys(cur).forEach(function (id) { if (prev[id] === undefined) set[cur[id]] = 1; });   // появились
+    Object.keys(prev).forEach(function (id) { if (cur[id] === undefined) set[prev[id]] = 1; });  // исчезли (удаление)
+  }
+  props_().setProperty('TX_SEEN', serializeSeenTx_(cur));
+  return { ids: Object.keys(set), первыйПрогон: first, операцийВОкне: Object.keys(cur).length };
+}
+
+// Компактное хранение «номер операции:товар» через запятую. Ограничиваем длину: у Script
+// Property лимит ~9 КБ, при переполнении отбрасываем самые старые номера (их подхватит
+// ночная полная сверка).
+function serializeSeenTx_(map) {
+  var ids = Object.keys(map).sort(function (a, b) { return Number(b) - Number(a); });   // новые вперёд
+  var parts = [], len = 0;
+  for (var i = 0; i < ids.length; i++) {
+    var piece = ids[i] + ':' + map[ids[i]];
+    if (len + piece.length + 1 > 8000) break;
+    parts.push(piece); len += piece.length + 1;
+  }
+  return parts.join(',');
+}
+
+function parseSeenTx_(str) {
+  var out = {};
+  String(str || '').split(',').forEach(function (pair) {
+    if (!pair) return;
+    var i = pair.indexOf(':');
+    if (i > 0) out[pair.slice(0, i)] = pair.slice(i + 1);
+  });
+  return out;
 }
 
 // ─── ПОЛНАЯ СВЕРКА (триггер раз в сутки, ночь): весь master-список остатков+цен → Тильда ──
@@ -731,7 +768,7 @@ function doGet(e) {
       case 'ping': return jsonOut_({ ok: true, ts: String(new Date()) });
       // Разовая установка доступов в Script Properties (значения приходят параметрами).
       case 'setup': {
-        var keys = ['PARTNER_TOKEN', 'USER_TOKEN', 'COMPANY_ID', 'WRITEOFF_MASTER_ID', 'TILDA_CML_URL', 'TILDA_CML_LOGIN', 'TILDA_CML_PASS', 'TILDA_PRICE_ID', 'CONTROL_SHEET_ID', 'STORE_STORAGE_ID', 'LAST_SYNC_TS', 'ORDER_SEQ_NEXT'];
+        var keys = ['PARTNER_TOKEN', 'USER_TOKEN', 'COMPANY_ID', 'WRITEOFF_MASTER_ID', 'TILDA_CML_URL', 'TILDA_CML_LOGIN', 'TILDA_CML_PASS', 'TILDA_PRICE_ID', 'CONTROL_SHEET_ID', 'STORE_STORAGE_ID', 'LAST_SYNC_TS', 'ORDER_SEQ_NEXT', 'TX_SEEN'];
         var set = [];
         keys.forEach(function (k) { if (p[k] != null && p[k] !== '') { props_().setProperty(k, String(p[k])); set.push(k); } });
         return jsonOut_({ ok: true, set: set });
@@ -885,8 +922,9 @@ function doGet(e) {
       // Создать таблицу-журнал и запомнить её id.
       case 'createControl': { var cs = SpreadsheetApp.create('tilda-yclients — журнал интеграции'); props_().setProperty('CONTROL_SHEET_ID', cs.getId()); statusSheet_(); return jsonOut_({ ok: true, id: cs.getId(), url: cs.getUrl() }); }
       case 'installTriggers': return jsonOut_({ ok: true, triggers: installTriggers_() });
-      case 'changedNew': { var cn = changedGoodIdsNew_(); return jsonOut_({ ok: true, count: cn.ids.length, maxId: cn.maxId, lastTxId: prop_('LAST_TX_ID') }); }
-      case 'primeTx': { var pt = changedGoodIdsNew_(); props_().setProperty('LAST_TX_ID', String(pt.maxId)); return jsonOut_({ ok: true, primedTo: pt.maxId }); }
+      case 'changedNew': { var cn = changedGoodIdsNew_(); return jsonOut_({ ok: true, изменившихсяТоваров: cn.ids.length, товары: cn.ids, операцийВОкне: cn.операцийВОкне, первыйПрогон: cn.первыйПрогон }); }
+      // Запомнить текущее состояние без отправки на сайт (чтобы первый прогон не залил всё разом).
+      case 'primeTx': { var pt = changedGoodIdsNew_(); return jsonOut_({ ok: true, операцийЗапомнено: pt.операцийВОкне }); }
       case 'runInc': syncStockToTilda_(); return jsonOut_({ ok: true, lastSync: prop_('LAST_SYNC_TS') });
       case 'runFull': { var rf = syncFullToTilda_(); return jsonOut_({ ok: true, результат: rf, lastSync: prop_('LAST_SYNC_TS') }); }
       // Боевой тест списания: спишет 1 шт товара good_id и НЕ должен создать финоперацию.
