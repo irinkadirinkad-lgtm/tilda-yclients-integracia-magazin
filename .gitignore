@@ -1,0 +1,8 @@
+# Токены OAuth — НИКОГДА не коммитим (безопасность)
+.clasprc.json
+*.clasprc.json
+
+# Служебное
+node_modules/
+.DS_Store
+*.log
