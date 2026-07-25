@@ -492,58 +492,65 @@ function parseTildaOrder_(e) {
     if (raw && String(raw).trim().charAt(0) === '{') body = JSON.parse(raw) || {};
   } catch (ignore) {}
 
-  // Единая карта полей: form-поля + JSON-тело (form приоритетнее).
-  var all = {};
-  Object.keys(body).forEach(function (k) { all[k] = body[k]; });
-  Object.keys(p).forEach(function (k) { if (p[k] != null && p[k] !== '') all[k] = p[k]; });
+  // ⚠️ РЕАЛЬНЫЙ ФОРМАТ ТИЛЬДЫ (снят на боевом 25.07): form-urlencoded с КВАДРАТНЫМИ СКОБКАМИ,
+  // а не JSON-строка в поле payment. Пример полей:
+  //   payment[orderid]=1421600022, payment[systranid]=0, payment[amount]=600,
+  //   payment[products][0][name]=…, [quantity]=1, [amount]=600, [price]=600,
+  //   payment[products][0][externalid]=_11204288, formname=Cart, formid=form238894675
+  // Поэтому сначала «разворачиваем» скобки в обычный объект.
+  var flat = {};
+  Object.keys(body).forEach(function (k) { flat[k] = body[k]; });
+  Object.keys(p).forEach(function (k) { if (p[k] != null && p[k] !== '') flat[k] = p[k]; });
+  var data = unflattenParams_(flat);
 
-  // ─ НОМЕР ЗАКАЗА ─
-  // Сначала известные имена. Если их нет — ищем поле, ПОХОЖЕЕ на номер заказа, включая
-  // русские имена: у Тильды поля формы называются как в конструкторе («Способ_оплаты» и т.п.),
-  // поэтому номер может прийти, например, как «Номер_заказа» (проверено на боевом 25.07).
+  var pay = data.payment;
+  if (typeof pay === 'string') { try { pay = JSON.parse(pay); } catch (ignore2) { pay = null; } }
+  pay = pay || {};
+
+  // ─ НОМЕР ЗАКАЗА ─ у Тильды это payment[orderid]. systranid бывает 0 — его не берём.
   var tranid = '';
-  ['tranid', 'orderid', 'order_id', 'systranid', 'ORDERID', 'orderId'].forEach(function (k) {
-    if (!tranid && all[k] != null && String(all[k]) !== '') tranid = String(all[k]);
+  [pay.orderid, pay.order_id, pay.systranid, flat.tranid, flat.orderid, data.tranid].forEach(function (v) {
+    if (!tranid && v != null && String(v) !== '' && String(v) !== '0') tranid = String(v);
   });
-  if (!tranid) {
-    Object.keys(all).forEach(function (k) {
-      if (tranid) return;
-      var v = all[k];
-      if (v == null || typeof v === 'object') return;
-      v = String(v).trim();
-      // короткое значение, похожее на номер, у поля с «номер/заказ/заявк/order/tran» в имени
-      if (/номер|заказ|заявк|order|tran/i.test(k) && v && v.length <= 40 && /\d/.test(v)) tranid = v;
-    });
-  }
 
-  // ─ СОСТАВ ЗАКАЗА ─
-  function asArray(v) {
-    if (!v) return null;
-    if (typeof v === 'string') { try { v = JSON.parse(v); } catch (ignore2) { return null; } }
-    if (v && v.products) v = v.products;                 // объект payment целиком
-    return (v && v.length) ? v : null;
-  }
-  var products = asArray(all.payment) || asArray(all.products) || null;
-  if (!products) {                                        // поле состава тоже может звучать иначе
-    Object.keys(all).forEach(function (k) {
-      if (products) return;
-      if (/product|товар|позиц|cart|корзин/i.test(k)) products = asArray(all[k]);
-    });
+  // ─ СОСТАВ ─ payment.products может быть массивом (из скобок) или объектом {0:{...}}.
+  var products = pay.products || data.products || null;
+  if (typeof products === 'string') { try { products = JSON.parse(products); } catch (ignore3) { products = null; } }
+  if (products && !products.length && typeof products === 'object') {       // объект с числовыми ключами
+    products = Object.keys(products).sort().map(function (k) { return products[k]; });
   }
 
   var items = [];
-  if (products) {
-    products.forEach(function (pr) {
-      if (!pr || typeof pr !== 'object') return;
-      items.push({
-        name: pr.name || pr.title || '',
-        externalid: pr.externalid || pr.externalId || pr.external_id || pr.sku,
-        sku: pr.sku,
-        quantity: Number(pr.quantity || pr.amount || pr.qty || 1) || 1
-      });
+  (products || []).forEach(function (pr) {
+    if (!pr || typeof pr !== 'object') return;
+    items.push({
+      name: pr.name || pr.title || '',
+      externalid: pr.externalid || pr.externalId || pr.external_id || pr.sku,
+      sku: pr.sku,
+      quantity: Number(pr.quantity || pr.qty || 1) || 1     // ⚠️ НЕ amount: у Тильды amount = сумма
     });
-  }
+  });
   return { tranid: String(tranid), items: items };
+}
+
+// «Разворачивает» поля вида a[b][0][c] в обычный вложенный объект/массив.
+function unflattenParams_(flat) {
+  var out = {};
+  Object.keys(flat).forEach(function (key) {
+    var m = String(key).match(/^([^\[]+)((\[[^\]]*\])*)$/);
+    if (!m) { out[key] = flat[key]; return; }
+    var path = [m[1]];
+    var rest = m[2] || '';
+    rest.replace(/\[([^\]]*)\]/g, function (_, part) { path.push(part); return ''; });
+    var node = out;
+    for (var i = 0; i < path.length - 1; i++) {
+      var seg = path[i], nextIsIndex = /^\d+$/.test(path[i + 1]);
+      if (node[seg] == null || typeof node[seg] !== 'object') node[seg] = nextIsIndex ? [] : {};
+      node = node[seg];
+    }
+    node[path[path.length - 1]] = flat[key];
+  });
+  return out;
 }
 
 // Сырое тело/поля вебхука — для журнала, когда заказ не распознан (обрезаем: там ПД клиента).
@@ -588,6 +595,27 @@ function doGet(e) {
         }
         return jsonOut_({ ok: true, удалено: delN, осталось: shN.getLastRow() - 1 });
       }
+      // Складские и финансовые операции за дату (только чтение) — сверка после заказа.
+      case 'opsOn': {
+        var d = String(p.date || formatDate_(new Date()).slice(0, 10));
+        var tx = ycGet_('/storages/transactions/' + companyId_(), { start_date: d, end_date: d, count: 1000 });
+        var fin = ycGet_('/transactions/' + companyId_(), { start_date: d, end_date: d, count: 200 });
+        return jsonOut_({ ok: true, дата: d,
+          складские: ((tx && tx.data) || []).map(function (t) {
+            return { документ: t.document_id, тип: t.type, кол: t.amount, сумма: t.cost,
+                     товар: (t.good || {}).title, комментарий: t.comment, время: t.create_date };
+          }),
+          финансовые: ((fin && fin.data) || []).map(function (f) {
+            return { id: f.id, сумма: f.amount, статья: (f.expense || {}).title, комментарий: f.comment };
+          }) });
+      }
+      // Забыть заказ (снять отметку идемпотентности), чтобы обработать его заново.
+      case 'forgetOrder': {
+        var tid = String(p.tranid || ''); if (!tid) return jsonOut_({ ok: false, error: 'нужен параметр tranid' });
+        var had = !!prop_('order_' + tid);
+        props_().deleteProperty('order_' + tid);
+        return jsonOut_({ ok: true, заказ: tid, былОтмечен: had });
+      }
       // Какие заказы приёмник считает обработанными (ключи идемпотентности). Только чтение.
       case 'orderKeys': {
         var allK = props_().getProperties(), rowsK = [];
@@ -600,7 +628,7 @@ function doGet(e) {
       case 'lastLog': {
         var shL = statusSheet_(), n = Number(p.n || 15), valsL = shL.getDataRange().getValues();
         var head = valsL[0], rowsL = valsL.slice(1).slice(-n).map(function (r) {
-          return { дата: String(r[0]), операция: r[1], статус: r[2], детали: String(r[3] || '').slice(0, 300), длительность: r[4] };
+          return { дата: String(r[0]), операция: r[1], статус: r[2], детали: String(r[3] || '').slice(0, 2500), длительность: r[4] };
         });
         return jsonOut_({ ok: true, всегоСтрок: valsL.length - 1, колонки: head, строки: rowsL });
       }
