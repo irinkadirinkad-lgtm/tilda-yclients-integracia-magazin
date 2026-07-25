@@ -628,6 +628,14 @@ function doGet(e) {
         }
         return jsonOut_({ ok: true, удалено: delN, осталось: shN.getLastRow() - 1 });
       }
+      // Какие листы есть в журнал-таблице и сколько в них строк.
+      case 'sheets': {
+        var ss = SpreadsheetApp.openById(requireProp_('CONTROL_SHEET_ID'));
+        return jsonOut_({ ok: true, таблица: ss.getName(), ссылка: ss.getUrl(),
+          листы: ss.getSheets().map(function (sh) {
+            return { имя: sh.getName(), строк: Math.max(0, sh.getLastRow()), колонок: sh.getLastColumn() };
+          }) });
+      }
       // Складские и финансовые операции за дату (только чтение) — сверка после заказа.
       case 'opsOn': {
         var d = String(p.date || formatDate_(new Date()).slice(0, 10));
@@ -762,6 +770,14 @@ function statusSheet_() {
   var ss = SpreadsheetApp.openById(requireProp_('CONTROL_SHEET_ID'));
   var sh = ss.getSheetByName('Статус автоматики');
   if (!sh) { sh = ss.insertSheet('Статус автоматики'); sh.appendRow(['Дата', 'Операция', 'Статус', 'Детали', 'Длительность']); }
+  // Google при создании таблицы добавляет пустой «Лист1» — он никогда не заполняется и только
+  // путает (вопрос Ирины 25.07). Удаляем, если он пуст и есть другие листы.
+  try {
+    ['Лист1', 'Sheet1'].forEach(function (name) {
+      var def = ss.getSheetByName(name);
+      if (def && def.getLastRow() === 0 && ss.getSheets().length > 1) ss.deleteSheet(def);
+    });
+  } catch (ignore) {}
   return sh;
 }
 
