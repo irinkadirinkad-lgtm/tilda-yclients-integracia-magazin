@@ -379,8 +379,11 @@ function doPost(e) {
     // Не распознали заказ — НЕ молчим: в журнал + письмо, иначе заказ потеряется незаметно.
     if (!order.tranid) {
       var rawNoId = rawOrderPayload_(e);
-      logStatus_('Заказ с сайта', 'ОШИБКА', 'не найден номер заказа; тело: ' + rawNoId, new Date());
-      reportError_('Приём заказа с сайта', new Error('Не найден номер заказа (tranid). Тело: ' + rawNoId));
+      // Сначала СПИСОК ПОЛЕЙ (компактно и полностью), потом тело: у Тильды поля могут быть
+      // с русскими именами, и по обрезанному телу их не видно (проверено 25.07).
+      var infoNoId = 'поля: ' + payloadFields_(e) + ' || тело: ' + rawNoId;
+      logStatus_('Заказ с сайта', 'ОШИБКА', 'не найден номер заказа; ' + infoNoId, new Date());
+      reportError_('Приём заказа с сайта', new Error('Не найден номер заказа. ' + infoNoId));
       return jsonOut_({ ok: false, error: 'no tranid' });
     }
     // Номер есть, а состав не распознан — сигнал: поля вебхука не те, что мы ждём.
@@ -466,24 +469,54 @@ function parseTildaOrder_(e) {
     if (raw && String(raw).trim().charAt(0) === '{') body = JSON.parse(raw) || {};
   } catch (ignore) {}
 
-  function pick(k) { return (p[k] != null && p[k] !== '') ? p[k] : body[k]; }
-  var tranid = pick('tranid') || pick('orderid') || pick('order_id') || pick('systranid') || '';
+  // Единая карта полей: form-поля + JSON-тело (form приоритетнее).
+  var all = {};
+  Object.keys(body).forEach(function (k) { all[k] = body[k]; });
+  Object.keys(p).forEach(function (k) { if (p[k] != null && p[k] !== '') all[k] = p[k]; });
 
-  // Состав заказа: payment.products (у Тильды — JSON-строка в form-поле или объект в теле),
-  // либо products на верхнем уровне.
-  var pay = pick('payment');
-  if (typeof pay === 'string') { try { pay = JSON.parse(pay); } catch (ignore) { pay = null; } }
-  var products = (pay && pay.products) || body.products || p.products || null;
-  if (typeof products === 'string') { try { products = JSON.parse(products); } catch (ignore) { products = null; } }
+  // ─ НОМЕР ЗАКАЗА ─
+  // Сначала известные имена. Если их нет — ищем поле, ПОХОЖЕЕ на номер заказа, включая
+  // русские имена: у Тильды поля формы называются как в конструкторе («Способ_оплаты» и т.п.),
+  // поэтому номер может прийти, например, как «Номер_заказа» (проверено на боевом 25.07).
+  var tranid = '';
+  ['tranid', 'orderid', 'order_id', 'systranid', 'ORDERID', 'orderId'].forEach(function (k) {
+    if (!tranid && all[k] != null && String(all[k]) !== '') tranid = String(all[k]);
+  });
+  if (!tranid) {
+    Object.keys(all).forEach(function (k) {
+      if (tranid) return;
+      var v = all[k];
+      if (v == null || typeof v === 'object') return;
+      v = String(v).trim();
+      // короткое значение, похожее на номер, у поля с «номер/заказ/заявк/order/tran» в имени
+      if (/номер|заказ|заявк|order|tran/i.test(k) && v && v.length <= 40 && /\d/.test(v)) tranid = v;
+    });
+  }
+
+  // ─ СОСТАВ ЗАКАЗА ─
+  function asArray(v) {
+    if (!v) return null;
+    if (typeof v === 'string') { try { v = JSON.parse(v); } catch (ignore2) { return null; } }
+    if (v && v.products) v = v.products;                 // объект payment целиком
+    return (v && v.length) ? v : null;
+  }
+  var products = asArray(all.payment) || asArray(all.products) || null;
+  if (!products) {                                        // поле состава тоже может звучать иначе
+    Object.keys(all).forEach(function (k) {
+      if (products) return;
+      if (/product|товар|позиц|cart|корзин/i.test(k)) products = asArray(all[k]);
+    });
+  }
 
   var items = [];
-  if (products && products.length) {
+  if (products) {
     products.forEach(function (pr) {
+      if (!pr || typeof pr !== 'object') return;
       items.push({
         name: pr.name || pr.title || '',
-        externalid: pr.externalid || pr.externalId || pr.sku,
+        externalid: pr.externalid || pr.externalId || pr.external_id || pr.sku,
         sku: pr.sku,
-        quantity: Number(pr.quantity || pr.amount || 1) || 1
+        quantity: Number(pr.quantity || pr.amount || pr.qty || 1) || 1
       });
     });
   }
@@ -495,7 +528,7 @@ function rawOrderPayload_(e) {
   var out = '';
   try { out = (e && e.postData && e.postData.contents) || ''; } catch (ignore) {}
   if (!out) { try { out = JSON.stringify((e && e.parameter) || {}); } catch (ignore) { out = '?'; } }
-  return String(out).slice(0, 900);
+  return String(out).slice(0, 2000);   // 900 не хватало: русские поля Тильды уходили за обрез
 }
 
 // ─── Идемпотентность обработанных заказов ─────────────────────────────────────
@@ -547,6 +580,15 @@ function doGet(e) {
           return { дата: String(r[0]), операция: r[1], статус: r[2], детали: String(r[3] || '').slice(0, 300), длительность: r[4] };
         });
         return jsonOut_({ ok: true, всегоСтрок: valsL.length - 1, колонки: head, строки: rowsL });
+      }
+      // Точечное удаление строк журнала по подстроке (для уборки следов, когда маркера нет).
+      case 'purgeMatch': {
+        var q = String(p.q || ''); if (!q) return jsonOut_({ ok: false, error: 'нужен параметр q' });
+        var shM = statusSheet_(), delM = 0, valsM = shM.getDataRange().getValues();
+        for (var rm = valsM.length - 1; rm >= 1; rm--) {
+          if (valsM[rm].join(' ').indexOf(q) !== -1) { shM.deleteRow(rm + 1); delM++; }
+        }
+        return jsonOut_({ ok: true, удалено: delM });
       }
       // Чистка следов тестов: ключи идемпотентности и строки журнала с тестовыми маркерами.
       // Правило Ирины: после тестов история должна быть чистой. Удалить вместе с остальным люком.
