@@ -155,6 +155,20 @@ function goodIdFromExternal_(ext) {
 }
 
 // Карточки конкретных good_id (для точечного теста фида). Возвращает [{good_id,title,article,price,amount}].
+// Выбирает ДЕШЁВЫЙ способ прочитать нужные товары.
+// Поштучно (`/goods/{id}`) — это 1 запрос на товар: хорошо для 1–20 позиций (обычная продажа).
+// Но ПРИХОД накладной у Ирины бывает на 50–150 позиций (реальные цифры, 26.07) — тогда поштучно
+// это 150 запросов подряд, всплеск и минуты работы. Постраничное чтение всего каталога стоит
+// ВСЕГО ~8 запросов независимо от количества, поэтому на больших приходах берём его.
+var BULK_READ_FROM_ = 20;
+function fetchGoodsSmart_(ids) {
+  if (ids.length <= BULK_READ_FROM_) return fetchGoodsByIds_(ids);
+  var want = {}; ids.forEach(function (x) { want[String(x)] = 1; });
+  var out = fetchStoreGoods_().filter(function (g) { return want[String(g.good_id)]; });
+  out._skipped = [];
+  return out;
+}
+
 function fetchGoodsByIds_(ids) {
   var storageId = resolveStoreStorageId_(), out = [], skipped = [];
   ids.forEach(function (id) {
@@ -384,8 +398,8 @@ function syncStockToTilda_() {
     var d = changedGoodIdsNew_();                         // {ids, maxId} — новые складские операции по номеру
     if (d.ids.length) {
       addMasterIds_(d.ids);                               // новые товары — в master-список
-      var goods = fetchGoodsByIds_(d.ids);
-      var res = goods.length ? pushFeed_(goods) : 'нет карточек';
+      var goods = fetchGoodsSmart_(d.ids);                // поштучно или каталогом — что дешевле
+      var res = goods.length ? pushFeedBatched_(goods) : 'нет карточек';
       logStatus_('Обновление сайта', 'OK', 'изменённых: ' + goods.length + ' | ' + res, started);
     } else {
       // «Изменений нет» в журнал НЕ пишем: это 288 пустых строк в сутки, журнал становится
@@ -489,13 +503,8 @@ function syncFullToTilda_() {
     var all = fetchStoreGoods_();
     var goods = all.filter(function (g) { return want[String(g.good_id)]; });
 
-    var pushed = 0, batches = 0, SIZE = 250;   // крупные партии = меньше обращений к Тильде
-    for (var i = 0; i < goods.length; i += SIZE) {
-      if (i > 0) Utilities.sleep(8000);         // пауза между партиями — не упираться в лимит частоты
-      pushFeed_(goods.slice(i, i + SIZE));
-      pushed += Math.min(SIZE, goods.length - i);
-      batches++;
-    }
+    pushFeedBatched_(goods);                    // партии по 250 с паузами (см. pushFeedBatched_)
+    var pushed = goods.length, batches = Math.ceil(goods.length / FEED_BATCH_);
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
     logStatus_('Полная сверка сайта', 'OK', 'сверено товаров: ' + pushed + ' из ' + ids.length +
       ' (в каталоге ' + all.length + '), партий: ' + batches, started);
@@ -519,6 +528,20 @@ function addMasterIds_(ids) {
   var changed = false;
   ids.forEach(function (x) { x = String(x); if (!have[x]) { have[x] = 1; changed = true; } });
   if (changed) props_().setProperty('MASTER_GOOD_IDS', Object.keys(have).join(','));
+}
+
+// Заливка партиями: Тильда не любит частые обмены, а огромный XML не любит никто.
+// 250 товаров в партии, пауза 8 с между партиями. Используют оба прогона — и пятиминутка
+// (большой приход), и полная сверка.
+var FEED_BATCH_ = 250;
+function pushFeedBatched_(goods) {
+  var out = [], batches = 0;
+  for (var i = 0; i < goods.length; i += FEED_BATCH_) {
+    if (i > 0) Utilities.sleep(8000);
+    out.push(pushFeed_(goods.slice(i, i + FEED_BATCH_)));
+    batches++;
+  }
+  return out.join(' | ') + (batches > 1 ? (' | партий: ' + batches) : '');
 }
 
 // Собирает import.xml + offers.xml по товарам и заливает в Тильду одним обменом.
