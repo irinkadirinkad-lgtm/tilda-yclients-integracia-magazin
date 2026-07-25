@@ -154,7 +154,7 @@ function createOnlineSale_(items, comment) {
     storage_id: Number(resolveStoreStorageId_()),
     master_id: master,
     create_date: formatDate_(new Date()),
-    comment: comment || 'Заказ интернет-магазина (Тильда)',
+    comment: comment || "Заказ с интернет-магазина EL'NATUREL SHOP",
     goods_transactions: items.map(function (it) {
       return {
         good_id: Number(it.good_id),
@@ -352,13 +352,13 @@ function doPost(e) {
     // Не распознали заказ — НЕ молчим: в журнал + письмо, иначе заказ потеряется незаметно.
     if (!order.tranid) {
       var rawNoId = rawOrderPayload_(e);
-      logStatus_('Заказ Тильды', 'ОШИБКА', 'не найден номер заказа; тело: ' + rawNoId, new Date());
-      reportError_('Приём заказа Тильды', new Error('Не найден номер заказа (tranid). Тело: ' + rawNoId));
+      logStatus_('Заказ с сайта', 'ОШИБКА', 'не найден номер заказа; тело: ' + rawNoId, new Date());
+      reportError_('Приём заказа с сайта', new Error('Не найден номер заказа (tranid). Тело: ' + rawNoId));
       return jsonOut_({ ok: false, error: 'no tranid' });
     }
     // Номер есть, но состава нет — тоже сигнал (формат полей мог измениться).
     if (!order.items.length) {
-      logStatus_('Заказ Тильды', 'ВНИМАНИЕ', '#' + order.tranid + ' без состава; тело: ' + rawOrderPayload_(e), new Date());
+      logStatus_('Заказ с сайта', 'ВНИМАНИЕ', '#' + order.tranid + ' без состава; тело: ' + rawOrderPayload_(e), new Date());
     }
     if (isProcessed_(order.tranid)) return jsonOut_({ ok: true, dup: true });   // идемпотентность
 
@@ -370,16 +370,16 @@ function doPost(e) {
       else unmatched.push(it);
     });
 
-    if (items.length) createOnlineSale_(items, 'Заказ Тильды #' + order.tranid);
+    if (items.length) createOnlineSale_(items, "Заказ с интернет-магазина EL'NATUREL SHOP №" + order.tranid);
     markProcessed_(order.tranid);
     if (unmatched.length) {
       logUnmatched_('order_no_match', unmatched.map(function (u) { return (u.name || '') + ' [' + (u.externalid || u.sku || '') + ']'; }));
-      reportError_('Заказ Тильды #' + order.tranid, new Error('Не сопоставлены позиции: ' + unmatched.length));
+      reportError_('Заказ с сайта №' + order.tranid, new Error('Не сопоставлены позиции: ' + unmatched.length));
     }
-    logStatus_('Заказ Тильды', 'OK', '#' + order.tranid + ', списано позиций: ' + items.length, new Date());
+    logStatus_('Заказ с сайта', 'OK', '#' + order.tranid + ', списано позиций: ' + items.length, new Date());
     return jsonOut_({ ok: true, written: items.length, unmatched: unmatched.length });
   } catch (err) {
-    reportError_('Приём заказа Тильды (doPost)', err);
+    reportError_('Приём заказа с сайта (doPost)', err);
     return jsonOut_({ ok: false, error: String(err && err.message || err) });
   }
 }
@@ -453,6 +453,28 @@ function doGet(e) {
         if (r1.code >= 200 && r1.code < 300) return jsonOut_({ ok: true, via: 'operation', result: r1 });
         var r2 = ycDelete_('/storage_operations/documents/' + companyId_() + '/' + p.doc);
         return jsonOut_({ ok: (r2.code >= 200 && r2.code < 300), via: 'documents', tried_operation: r1, result: r2 });
+      }
+      // Последние строки журнала (только чтение) — быстрая проверка прогонов и заказов.
+      case 'lastLog': {
+        var shL = statusSheet_(), n = Number(p.n || 15), valsL = shL.getDataRange().getValues();
+        var head = valsL[0], rowsL = valsL.slice(1).slice(-n).map(function (r) {
+          return { дата: String(r[0]), операция: r[1], статус: r[2], детали: String(r[3] || '').slice(0, 300), длительность: r[4] };
+        });
+        return jsonOut_({ ok: true, всегоСтрок: valsL.length - 1, колонки: head, строки: rowsL });
+      }
+      // Чистка следов тестов: ключи идемпотентности и строки журнала с тестовыми маркерами.
+      // Правило Ирины: после тестов история должна быть чистой. Удалить вместе с остальным люком.
+      case 'cleanupTests': {
+        var MARK = /TEST|PROBE|PROD-|CHECK/i;
+        var allProps = props_().getProperties(), delKeys = [];
+        Object.keys(allProps).forEach(function (k) {
+          if (k.indexOf('order_') === 0 && MARK.test(k)) { props_().deleteProperty(k); delKeys.push(k); }
+        });
+        var shC = statusSheet_(), delRows = 0, valsC = shC.getDataRange().getValues();
+        for (var rc = valsC.length - 1; rc >= 1; rc--) {
+          if (MARK.test(String(valsC[rc][3] || '') + ' ' + String(valsC[rc][2] || ''))) { shC.deleteRow(rc + 1); delRows++; }
+        }
+        return jsonOut_({ ok: true, deletedKeys: delKeys, deletedRows: delRows });
       }
       case 'storages': return jsonOut_({ ok: true, data: ycGet_('/storages/' + companyId_()).data });
       case 'storeStorageId': return jsonOut_({ ok: true, storeStorageId: resolveStoreStorageId_() });
