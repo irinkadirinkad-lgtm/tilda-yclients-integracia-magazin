@@ -164,6 +164,8 @@ function createOnlineSale_(items, comment) {
         cost: 0,
         operation_unit_type: 1,       // 1 = продажа
         master_id: master
+        // Комментарий в ПОЗИЦИИ операции YClients игнорирует (проверено 25.07: остаётся пустым),
+        // поэтому подпись живёт только на документе — см. setDocumentComment_ ниже.
       };
     })
   };
@@ -463,17 +465,24 @@ function doPost(e) {
     // Номер заказа берём ТОТ, ЧТО ПРИСЫЛАЕТ ТИЛЬДА (Ирина настроила передачу номера ЗАЯВКИ —
     // это её сквозная нумерация). Своего счётчика не держим и в скобках ничего не дублируем,
     // чтобы не было двух номеров (решение Ирины 25.07).
+    // Номер в комментарии — СКВОЗНАЯ НУМЕРАЦИЯ ИРИНЫ (её «порядковый номер заявки»).
+    // Тильда его в вебхук НЕ передаёт: приходит только внутренний payment[orderid], а
+    // payment[systranid] всегда 0 (проверено на боевом 25.07). Поэтому ведём счётчик сами.
+    // Внутренний id Тильды в комментарий НЕ пишем (решение Ирины — один номер), но кладём
+    // в журнал: если нумерация когда-нибудь разойдётся, по нему можно сопоставить заказ.
+    var ourNo = null;
     if (items.length) {
-      createOnlineSale_(items, "Заказ с интернет-магазина EL'NATUREL SHOP №" + order.tranid);
+      ourNo = nextOrderNo_();
+      createOnlineSale_(items, "Заказ с интернет-магазина EL'NATUREL SHOP №" + ourNo);
     }
     markProcessed_(order.tranid);
     if (unmatched.length) {
       logUnmatched_('order_no_match', unmatched.map(function (u) { return (u.name || '') + ' [' + (u.externalid || u.sku || '') + ']'; }));
       reportError_('Заказ с сайта №' + order.tranid, new Error('Не сопоставлены позиции: ' + unmatched.length));
     }
-    logStatus_('Заказ с сайта', 'OK', '№' + order.tranid + ', списано позиций: ' + items.length +
-      ' | поля вебхука: ' + payloadFields_(e), new Date());
-    return jsonOut_({ ok: true, orderNo: order.tranid, written: items.length, unmatched: unmatched.length });
+    logStatus_('Заказ с сайта', 'OK', '№' + (ourNo || '—') + ' (Тильда ' + order.tranid + ')' +
+      ', списано позиций: ' + items.length, new Date());
+    return jsonOut_({ ok: true, orderNo: ourNo, tildaId: order.tranid, written: items.length, unmatched: unmatched.length });
   } catch (err) {
     // Ошибку пишем И в журнал (раньше уходила только письмом — в журнале следа не оставалось).
     logStatus_('Заказ с сайта', 'ОШИБКА', String(err && err.message || err).slice(0, 250) +
@@ -594,6 +603,21 @@ function rawOrderPayload_(e) {
   return String(out).slice(0, 2000);   // 900 не хватало: русские поля Тильды уходили за обрез
 }
 
+// ─── Сквозная нумерация заказов (нумерация Ирины) ─────────────────────────────
+// ORDER_SEQ_NEXT = номер, который получит СЛЕДУЮЩИЙ заказ. Задаётся через
+// ?action=setup&ORDER_SEQ_NEXT=<n>, виден в ?action=master. Расходуется только когда есть что
+// списывать; повторный вебхук того же заказа отсекается идемпотентностью и номер не тратит.
+function nextOrderNo_() {
+  var lock = LockService.getScriptLock();
+  try { lock.waitLock(10000); } catch (e) {}
+  try {
+    var n = Number(prop_('ORDER_SEQ_NEXT') || 1);
+    if (!isFinite(n) || n < 1) n = 1;
+    props_().setProperty('ORDER_SEQ_NEXT', String(n + 1));
+    return n;
+  } finally { try { lock.releaseLock(); } catch (e) {} }
+}
+
 // ─── Идемпотентность обработанных заказов ─────────────────────────────────────
 function isProcessed_(tranid) { return !!prop_('order_' + tranid); }
 function markProcessed_(tranid) { props_().setProperty('order_' + tranid, String(new Date())); }
@@ -607,7 +631,7 @@ function doGet(e) {
       case 'ping': return jsonOut_({ ok: true, ts: String(new Date()) });
       // Разовая установка доступов в Script Properties (значения приходят параметрами).
       case 'setup': {
-        var keys = ['PARTNER_TOKEN', 'USER_TOKEN', 'COMPANY_ID', 'WRITEOFF_MASTER_ID', 'TILDA_CML_URL', 'TILDA_CML_LOGIN', 'TILDA_CML_PASS', 'TILDA_PRICE_ID', 'CONTROL_SHEET_ID', 'STORE_STORAGE_ID', 'LAST_SYNC_TS'];
+        var keys = ['PARTNER_TOKEN', 'USER_TOKEN', 'COMPANY_ID', 'WRITEOFF_MASTER_ID', 'TILDA_CML_URL', 'TILDA_CML_LOGIN', 'TILDA_CML_PASS', 'TILDA_PRICE_ID', 'CONTROL_SHEET_ID', 'STORE_STORAGE_ID', 'LAST_SYNC_TS', 'ORDER_SEQ_NEXT'];
         var set = [];
         keys.forEach(function (k) { if (p[k] != null && p[k] !== '') { props_().setProperty(k, String(p[k])); set.push(k); } });
         return jsonOut_({ ok: true, set: set });
@@ -641,10 +665,20 @@ function doGet(e) {
         var d = String(p.date || formatDate_(new Date()).slice(0, 10));
         var tx = ycGet_('/storages/transactions/' + companyId_(), { start_date: d, end_date: d, count: 1000 });
         var fin = ycGet_('/transactions/' + companyId_(), { start_date: d, end_date: d, count: 200 });
+        var docCache = {};
+        function docComment(id) {
+          if (docCache[id] === undefined) {
+            try { docCache[id] = ((ycGet_('/storage_operations/documents/' + companyId_() + '/' + id).data) || {}).comment; }
+            catch (er) { docCache[id] = '(не прочитан)'; }
+          }
+          return docCache[id];
+        }
         return jsonOut_({ ok: true, дата: d,
           складские: ((tx && tx.data) || []).map(function (t) {
             return { документ: t.document_id, тип: t.type, кол: t.amount, сумма: t.cost,
-                     товар: (t.good || {}).title, комментарий: t.comment, время: t.create_date };
+                     товар: (t.good || {}).title,
+                     комментарийОперации: t.comment, комментарийДокумента: docComment(t.document_id),
+                     время: t.create_date };
           }),
           финансовые: ((fin && fin.data) || []).map(function (f) {
             return { id: f.id, сумма: f.amount, статья: (f.expense || {}).title, комментарий: f.comment };
@@ -715,7 +749,7 @@ function doGet(e) {
       case 'previewFeed': { var pi = String(p.goods || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean); var pg = fetchGoodsByIds_(pi); return jsonOut_({ ok: true, importXml: buildImportXml_(pg), offersXml: buildOffersXml_(pg) }); }
       // Наполнить master-список good_id (частями, чтобы не упереться в длину URL).
       case 'seedMaster': { var sm = String(p.ids || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean); addMasterIds_(sm); return jsonOut_({ ok: true, added: sm.length, total: masterIds_().length }); }
-      case 'master': return jsonOut_({ ok: true, masterCount: masterIds_().length, lastSync: prop_('LAST_SYNC_TS'),
+      case 'master': return jsonOut_({ ok: true, masterCount: masterIds_().length, lastSync: prop_('LAST_SYNC_TS'), следующийНомерЗаказа: prop_('ORDER_SEQ_NEXT') || '(не задан → 1)',
         обращенийPOST: prop_('HITS_POST') || 0, последнийPOST: prop_('HITS_POST_LAST') || '—',
         отказовGET: prop_('HITS_GET_DENIED') || 0, последнийОтказGET: prop_('HITS_GET_DENIED_LAST') || '—',
         проверокТильды: prop_('HITS_TILDA_TEST') || 0, последняяПроверкаТильды: prop_('HITS_TILDA_TEST_LAST') || '—' });
