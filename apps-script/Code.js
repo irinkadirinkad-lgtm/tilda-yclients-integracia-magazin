@@ -382,6 +382,16 @@ function doPost(e) {
     // это уже настоящая проблема, о ней сообщаем.
     if (!isCartSubmission_(e)) {
       bumpHit_('HITS_PLAIN_FORM');
+      // ⚠️ Отброшенное ЗАПОМИНАЕМ (поля + обрезанное тело). 25.07 этот фильтр молча съел
+      // настоящий заказ Ирины: у Тильды состав пришёл НЕ в payment/products. Без сохранения
+      // тела мы этого не увидели бы. Смотреть: ?action=lastSkipped
+      try {
+        props_().setProperties({
+          LAST_SKIPPED_AT: String(new Date()),
+          LAST_SKIPPED_FIELDS: payloadFields_(e).slice(0, 800),
+          LAST_SKIPPED_RAW: rawOrderPayload_(e).slice(0, 800)
+        });
+      } catch (ignore3) {}
       return jsonOut_({ ok: true, skipped: 'не заказ (обычная форма)' });
     }
 
@@ -554,6 +564,9 @@ function doGet(e) {
         }
         return jsonOut_({ ok: true, удалено: delN, осталось: shN.getLastRow() - 1 });
       }
+      // Что именно было отброшено фильтром «не заказ» — поля и тело последнего такого запроса.
+      case 'lastSkipped': return jsonOut_({ ok: true, когда: prop_('LAST_SKIPPED_AT') || '—',
+        поля: prop_('LAST_SKIPPED_FIELDS') || '—', тело: prop_('LAST_SKIPPED_RAW') || '—' });
       // Какие заказы приёмник считает обработанными (ключи идемпотентности). Только чтение.
       case 'orderKeys': {
         var allK = props_().getProperties(), rowsK = [];
