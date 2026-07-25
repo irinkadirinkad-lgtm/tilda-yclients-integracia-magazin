@@ -149,7 +149,7 @@ function fetchGoodsByIds_(ids) {
 // items: [{good_id, amount}]. Возвращает документ-ответ YClients.
 function createOnlineSale_(items, comment) {
   var master = Number(requireProp_('WRITEOFF_MASTER_ID'));
-  var text = comment || "Заказ с интернет-магазина EL'NATUREL SHOP";
+  var text = comment || "Заказ из интернет-магазина El’Naturel Shop";   // текст подписи выбрала Ирина 25.07
 
   // ⚠️ ПОРЯДОК ВАЖЕН — он выбран ради надёжности (разобрано на боевом 25.07):
   // ШАГ 1. Операция создаётся ОДНИМ запросом (документ + все позиции). Это главное: списание
@@ -350,7 +350,7 @@ function syncStockToTilda_() {
       addMasterIds_(d.ids);                               // новые товары — в master-список
       var goods = fetchGoodsByIds_(d.ids);
       var res = goods.length ? pushFeed_(goods) : 'нет карточек';
-      logStatus_('Инкремент A', 'OK', 'изменённых: ' + goods.length + ' | ' + res, started);
+      logStatus_('Обновление сайта', 'OK', 'изменённых: ' + goods.length + ' | ' + res, started);
     } else {
       // «Изменений нет» в журнал НЕ пишем: это 288 пустых строк в сутки, журнал становится
       // нечитаемым (решение 25.07). Вместо этого — отметка «жив» раз в сутки, чтобы было видно,
@@ -359,13 +359,13 @@ function syncStockToTilda_() {
       var today = formatDate_(started).slice(0, 10);
       if (prop_('HEARTBEAT_DAY') !== today) {
         props_().setProperty('HEARTBEAT_DAY', today);
-        logStatus_('Инкремент A', 'OK', 'автоматика работает, изменений нет (отметка раз в сутки)', started);
+        logStatus_('Обновление сайта', 'OK', 'автоматика работает, изменений нет (отметка раз в сутки)', started);
       }
     }
     if (d.maxId) props_().setProperty('LAST_TX_ID', String(d.maxId));   // сдвигаем только после успешной заливки
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
   } catch (e) {
-    reportError_('Инкремент A (5 мин)', e);
+    reportError_('Обновление сайта (каждые 5 мин)', e);
   }
 }
 
@@ -406,7 +406,7 @@ function syncFullToTilda_() {
     // запросов, как было раньше (из-за них сверка стоила дорого и жила только ночью).
     // Набор товаров тот же — master-список; отправляем партиями, чтобы XML не был огромным.
     var ids = masterIds_();
-    if (!ids.length) { logStatus_('Полная сверка A', 'OK', 'master пуст', started); return; }
+    if (!ids.length) { logStatus_('Полная сверка сайта', 'OK', 'master пуст', started); return; }
     var want = {}; ids.forEach(function (x) { want[String(x)] = 1; });
 
     var all = fetchStoreGoods_();
@@ -420,11 +420,11 @@ function syncFullToTilda_() {
       batches++;
     }
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
-    logStatus_('Полная сверка A', 'OK', 'сверено товаров: ' + pushed + ' из ' + ids.length +
+    logStatus_('Полная сверка сайта', 'OK', 'сверено товаров: ' + pushed + ' из ' + ids.length +
       ' (в каталоге ' + all.length + '), партий: ' + batches, started);
     return { сверено: pushed, вMaster: ids.length, вКаталоге: all.length, партий: batches };
   } catch (e) {
-    reportError_('Полная сверка A', e);
+    reportError_('Полная сверка сайта', e);
     throw e;
   }
 }
@@ -508,7 +508,7 @@ function doPost(e) {
     var ourNo = null;
     if (items.length) {
       ourNo = nextOrderNo_();
-      createOnlineSale_(items, "Заказ с интернет-магазина EL'NATUREL SHOP №" + ourNo);
+      createOnlineSale_(items, "Заказ из интернет-магазина El’Naturel Shop №" + ourNo);
     }
     markProcessed_(order.tranid);
     if (unmatched.length) {
@@ -751,6 +751,22 @@ function doGet(e) {
           if (String(valsN[rn][3] || '').trim() === 'изменений нет') { shN.deleteRow(rn + 1); delN++; }
         }
         return jsonOut_({ ok: true, удалено: delN, осталось: shN.getLastRow() - 1 });
+      }
+      // Переподписать документ (позиции + документ) — если подпись не встала или изменился текст.
+      case 'resign': {
+        var rd = String(p.doc || ''), rt = String(p.text || '');
+        if (!rd || !rt) return jsonOut_({ ok: false, error: 'нужны doc и text' });
+        var op = ycGet_('/storage_operations/operation/' + companyId_() + '/' + rd);
+        var list = (((op || {}).data || {}).goods_transactions) || [];
+        var okTx = 0, errTx = [];
+        list.forEach(function (t) {
+          try { setTxComment_(rd, t, rt); okTx++; }
+          catch (er) { errTx.push(t.id + ': ' + String(er.message).slice(0, 120)); }
+        });
+        var docOk = true; try { setDocumentComment_(rd, rt); } catch (er) { docOk = String(er.message).slice(0, 120); }
+        var after = ycGet_('/storage_operations/operation/' + companyId_() + '/' + rd);
+        return jsonOut_({ ok: true, позицийПодписано: okTx, ошибкиПозиций: errTx, документ: docOk,
+          проверка: ((((after || {}).data || {}).goods_transactions) || []).map(function (t) { return t.comment; }) });
       }
       case 'retryNow': return jsonOut_({ ok: true, результат: retryPending_() });
       // Какие листы есть в журнал-таблице и сколько в них строк.
