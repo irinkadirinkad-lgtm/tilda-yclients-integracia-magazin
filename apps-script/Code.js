@@ -554,6 +554,14 @@ function doGet(e) {
         }
         return jsonOut_({ ok: true, удалено: delN, осталось: shN.getLastRow() - 1 });
       }
+      // Какие заказы приёмник считает обработанными (ключи идемпотентности). Только чтение.
+      case 'orderKeys': {
+        var allK = props_().getProperties(), rowsK = [];
+        Object.keys(allK).forEach(function (k) {
+          if (k.indexOf('order_') === 0) rowsK.push({ заказ: k.replace('order_', ''), когда: allK[k] });
+        });
+        return jsonOut_({ ok: true, всего: rowsK.length, ключи: rowsK });
+      }
       // Последние строки журнала (только чтение) — быстрая проверка прогонов и заказов.
       case 'lastLog': {
         var shL = statusSheet_(), n = Number(p.n || 15), valsL = shL.getDataRange().getValues();
