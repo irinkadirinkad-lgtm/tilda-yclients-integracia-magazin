@@ -272,7 +272,15 @@ function syncStockToTilda_() {
       var res = goods.length ? pushFeed_(goods) : 'нет карточек';
       logStatus_('Инкремент A', 'OK', 'изменённых: ' + goods.length + ' | ' + res, started);
     } else {
-      logStatus_('Инкремент A', 'OK', 'изменений нет', started);
+      // «Изменений нет» в журнал НЕ пишем: это 288 пустых строк в сутки, журнал становится
+      // нечитаемым (решение 25.07). Вместо этого — отметка «жив» раз в сутки, чтобы было видно,
+      // что автоматика работает, даже когда продаж не было. Точное время последнего прогона
+      // всегда есть в LAST_SYNC_TS (?action=master).
+      var today = formatDate_(started).slice(0, 10);
+      if (prop_('HEARTBEAT_DAY') !== today) {
+        props_().setProperty('HEARTBEAT_DAY', today);
+        logStatus_('Инкремент A', 'OK', 'автоматика работает, изменений нет (отметка раз в сутки)', started);
+      }
     }
     if (d.maxId) props_().setProperty('LAST_TX_ID', String(d.maxId));   // сдвигаем только после успешной заливки
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
@@ -531,6 +539,14 @@ function doGet(e) {
         if (r1.code >= 200 && r1.code < 300) return jsonOut_({ ok: true, via: 'operation', result: r1 });
         var r2 = ycDelete_('/storage_operations/documents/' + companyId_() + '/' + p.doc);
         return jsonOut_({ ok: (r2.code >= 200 && r2.code < 300), via: 'documents', tried_operation: r1, result: r2 });
+      }
+      // Разовая уборка: удалить пустые строки «изменений нет», накопившиеся до правки 25.07.
+      case 'purgeNoise': {
+        var shN = statusSheet_(), delN = 0, valsN = shN.getDataRange().getValues();
+        for (var rn = valsN.length - 1; rn >= 1; rn--) {
+          if (String(valsN[rn][3] || '').trim() === 'изменений нет') { shN.deleteRow(rn + 1); delN++; }
+        }
+        return jsonOut_({ ok: true, удалено: delN, осталось: shN.getLastRow() - 1 });
       }
       // Последние строки журнала (только чтение) — быстрая проверка прогонов и заказов.
       case 'lastLog': {
