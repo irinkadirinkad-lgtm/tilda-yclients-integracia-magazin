@@ -149,31 +149,23 @@ function fetchGoodsByIds_(ids) {
 // items: [{good_id, amount}]. Возвращает документ-ответ YClients.
 function createOnlineSale_(items, comment) {
   var master = Number(requireProp_('WRITEOFF_MASTER_ID'));
-  var storage = Number(resolveStoreStorageId_());
   var text = comment || "Заказ с интернет-магазина EL'NATUREL SHOP";
 
-  // ⚠️ ПОЧЕМУ В ДВА ЭТАПА (выяснено на боевом 25.07, важно не «упростить» обратно):
-  // в комбинированном запросе (документ + позиции сразу) YClients ТЕРЯЕТ комментарий позиции,
-  // а именно он показывается в СПИСКЕ складских операций — там, где Ирина просматривает продажи.
-  // Поэтому: сначала создаём ПУСТОЙ документ (остатки не двигаются), затем добавляем позиции
-  // отдельным эндпоинтом, где `comment` сохраняется (проверено: позиция получила подпись).
-  // Комментарий самого документа (виден в КАРТОЧКЕ) ставится третьим шагом, PUT-ом.
-  var doc = ycPost_('/storage_operations/operation/' + companyId_(), {
+  // ⚠️ ПОРЯДОК ВАЖЕН — он выбран ради надёжности (разобрано на боевом 25.07):
+  // ШАГ 1. Операция создаётся ОДНИМ запросом (документ + все позиции). Это главное: списание
+  //        атомарно, «половины» быть не может, лишних пустых документов не появляется.
+  // ШАГ 2. Подписи дописываем отдельно (PUT по позиции и по документу). YClients теряет
+  //        комментарий позиции при создании, но обновлением он ставится. Если этот шаг
+  //        сорвётся — остаток УЖЕ списан правильно, не хватает только подписи, и она
+  //        добирается очередью повторов. То есть сбой подписи не может испортить склад.
+  var res = ycPost_('/storage_operations/operation/' + companyId_(), {
     type_id: 1,                        // 1 = продажа товара
-    storage_id: storage,
+    storage_id: Number(resolveStoreStorageId_()),
     master_id: master,
     create_date: formatDate_(new Date()),
     comment: text,
-    goods_transactions: []
-  });
-  var docId = (doc && doc.data && (doc.data.document_id || (doc.data.document || {}).id)) || null;
-  if (!docId) throw new Error('YClients не вернул id документа: ' + JSON.stringify(doc).slice(0, 300));
-
-  var added = 0, failed = [];
-  items.forEach(function (it) {
-    try {
-      ycPost_('/storage_operations/goods_transactions/' + companyId_(), {
-        document_id: Number(docId),
+    goods_transactions: items.map(function (it) {
+      return {
         good_id: Number(it.good_id),
         amount: Number(it.amount),
         cost_per_unit: 0,
@@ -181,29 +173,51 @@ function createOnlineSale_(items, comment) {
         cost: 0,
         operation_unit_type: 1,        // 1 = продажа
         master_id: master,
-        comment: text                  // ← ЭТО и видно в списке операций
-      });
-      added++;
-    } catch (e) {
-      failed.push({ good_id: it.good_id, amount: it.amount, error: String(e && e.message || e).slice(0, 200) });
-    }
+        comment: text                  // при создании теряется, но пусть будет
+      };
+    })
   });
 
-  // Комментарий документа — для карточки операции. Ошибку не роняем: списание уже создано.
+  var data = (res && res.data) || {};
+  var docId = data.document_id || (data.document || {}).id || null;
+  var txs = data.goods_transactions || [];
+  if (!docId) throw new Error('YClients не вернул id документа: ' + JSON.stringify(res).slice(0, 300));
+
+  // ШАГ 2: подпись каждой позиции (её видно в СПИСКЕ операций).
+  txs.forEach(function (t) {
+    try { setTxComment_(docId, t, text); }
+    catch (e) { queueRetry_(docId, t.id, t.good_id, Math.abs(Number(t.amount)) || 1, text, String(e && e.message || e)); }
+  });
+  // Подпись документа (её видно в КАРТОЧКЕ).
   try { setDocumentComment_(docId, text); }
   catch (e) {
     logStatus_('Заказ с сайта', 'ВНИМАНИЕ', 'подпись документа не проставлена: ' +
       String(e && e.message || e).slice(0, 150), new Date());
   }
+  return { document_id: docId, позиций: txs.length };
+}
 
-  if (failed.length) {
-    // Часть позиций не легла — НЕ теряем: ставим в очередь повторов (её разбирает пятиминутка),
-    // плюс сразу пишем в журнал. Иначе остаток списался бы не полностью и незаметно.
-    failed.forEach(function (f) { queueRetry_(docId, f.good_id, f.amount, text, f.error); });
-    logStatus_('Заказ с сайта', 'ОШИБКА', 'документ ' + docId + ', в очередь повторов: ' +
-      failed.map(function (f) { return f.good_id; }).join(', '), new Date());
+// Дописывает комментарий ПОЗИЦИИ. PUT требует ПОЛНОЕ тело позиции — иначе 400 «Не указан
+// идентификатор товара». Значения передаём те же, что уже стоят, меняем только comment:
+// проверено, что количество и остаток при этом не меняются.
+function setTxComment_(docId, t, text) {
+  var body = {
+    document_id: Number(docId),
+    good_id: Number(t.good_id),
+    amount: Math.abs(Number(t.amount)) || 1,
+    cost_per_unit: Number(t.cost_per_unit) || 0,
+    discount: Number(t.discount) || 0,
+    cost: Number(t.cost) || 0,
+    operation_unit_type: Number(t.operation_unit_type) || 1,
+    master_id: Number(t.master_id) || Number(requireProp_('WRITEOFF_MASTER_ID')),
+    comment: text
+  };
+  var resp = UrlFetchApp.fetch(YC_BASE_ + '/storage_operations/goods_transactions/' + companyId_() + '/' + t.id,
+    { method: 'put', headers: ycHeaders_(), payload: JSON.stringify(body), muteHttpExceptions: true });
+  if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
+    throw new Error('PUT подписи позиции ' + t.id + ' → HTTP ' + resp.getResponseCode() + ': ' + resp.getContentText().slice(0, 200));
   }
-  return { document_id: docId, добавлено: added, неудачных: failed.length };
+  return true;
 }
 
 // Проставляет комментарий существующему складскому документу (см. пояснение выше).
@@ -635,18 +649,19 @@ function retrySheet_() {
   var sh = ss.getSheetByName('Очередь повторов');
   if (!sh) {
     sh = ss.insertSheet('Очередь повторов');
-    sh.appendRow(['Дата', 'Документ', 'good_id', 'Кол-во', 'Комментарий', 'Попыток', 'Статус', 'Последняя ошибка']);
+    sh.appendRow(['Дата', 'Документ', 'Позиция', 'good_id', 'Кол-во', 'Комментарий', 'Попыток', 'Статус', 'Последняя ошибка']);
   }
   return sh;
 }
 
-function queueRetry_(docId, goodId, amount, comment, error) {
+// В очередь попадают только НЕПРОСТАВЛЕННЫЕ ПОДПИСИ. Склад к этому моменту уже изменён верно,
+// поэтому повтор ничего не может задвоить — он лишь дописывает комментарий.
+function queueRetry_(docId, txId, goodId, amount, comment, error) {
   try {
-    retrySheet_().appendRow([new Date(), docId, goodId, amount, comment, 0, 'ждёт', String(error || '').slice(0, 300)]);
+    retrySheet_().appendRow([new Date(), docId, txId, goodId, amount, comment, 0, 'ждёт', String(error || '').slice(0, 300)]);
   } catch (e) {
-    // Даже если лист недоступен — не теряем сигнал.
-    sendErrorEmail_('Не удалось поставить позицию в очередь повторов',
-      'Документ ' + docId + ', товар ' + goodId + ', кол-во ' + amount + '. Ошибка: ' + error);
+    sendErrorEmail_('Не удалось поставить подпись в очередь повторов',
+      'Документ ' + docId + ', позиция ' + txId + '. Ошибка: ' + error);
   }
 }
 
@@ -658,37 +673,34 @@ function retryPending_() {
   var master = Number(requireProp_('WRITEOFF_MASTER_ID'));
   var done = 0, still = 0, dead = 0;
   for (var r = 1; r < vals.length; r++) {
-    if (String(vals[r][6]) !== 'ждёт') continue;
-    var docId = vals[r][1], goodId = vals[r][2], amount = Number(vals[r][3]) || 1;
-    var comment = String(vals[r][4] || ''), tries = Number(vals[r][5]) || 0;
+    if (String(vals[r][7]) !== 'ждёт') continue;
+    var docId = vals[r][1], txId = vals[r][2], goodId = vals[r][3], amount = Number(vals[r][4]) || 1;
+    var comment = String(vals[r][5] || ''), tries = Number(vals[r][6]) || 0;
     try {
-      ycPost_('/storage_operations/goods_transactions/' + companyId_(), {
-        document_id: Number(docId), good_id: Number(goodId), amount: amount,
-        cost_per_unit: 0, discount: 0, cost: 0, operation_unit_type: 1,
-        master_id: master, comment: comment
-      });
-      sh.getRange(r + 1, 6, 1, 3).setValues([[tries + 1, 'готово', '']]);
+      setTxComment_(docId, { id: txId, good_id: goodId, amount: amount, cost_per_unit: 0,
+        discount: 0, cost: 0, operation_unit_type: 1, master_id: master }, comment);
+      sh.getRange(r + 1, 7, 1, 3).setValues([[tries + 1, 'готово', '']]);
       done++;
     } catch (e) {
       var msg = String(e && e.message || e).slice(0, 300);
       if (tries + 1 >= MAX_RETRY_) {
-        sh.getRange(r + 1, 6, 1, 3).setValues([[tries + 1, 'не удалось', msg]]);
-        sendErrorEmail_('Позиция заказа так и не списалась',
-          'Документ ' + docId + ', товар ' + goodId + ', кол-во ' + amount +
-          '. Попыток: ' + (tries + 1) + '. Последняя ошибка: ' + msg +
-          '\n\nНужно добавить товар в эту операцию вручную в YClients.');
+        sh.getRange(r + 1, 7, 1, 3).setValues([[tries + 1, 'не удалось', msg]]);
+        sendErrorEmail_('Подпись операции так и не проставилась',
+          'Документ ' + docId + ', позиция ' + txId + '. Попыток: ' + (tries + 1) +
+          '. Последняя ошибка: ' + msg +
+          '\n\nСклад списан ВЕРНО — не хватает только комментария. Можно дописать вручную в YClients.');
         dead++;
       } else {
-        sh.getRange(r + 1, 6, 1, 3).setValues([[tries + 1, 'ждёт', msg]]);
+        sh.getRange(r + 1, 7, 1, 3).setValues([[tries + 1, 'ждёт', msg]]);
         still++;
       }
     }
   }
   if (done || dead) {
     logStatus_('Очередь повторов', dead ? 'ОШИБКА' : 'OK',
-      'долито: ' + done + ', ещё ждут: ' + still + ', не удалось: ' + dead, new Date());
+      'подписей дописано: ' + done + ', ещё ждут: ' + still + ', не удалось: ' + dead, new Date());
   }
-  return { долито: done, ждут: still, неУдалось: dead };
+  return { подписей: done, ждут: still, неУдалось: dead };
 }
 
 // ─── Сквозная нумерация заказов (нумерация Ирины) ─────────────────────────────
