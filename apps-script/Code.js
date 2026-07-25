@@ -347,10 +347,11 @@ function syncStockToTilda_() {
   try {
     var d = changedGoodIdsNew_();                         // {ids, maxId} — новые складские операции по номеру
     if (d.ids.length) {
-      addMasterIds_(d.ids);                               // новые товары — в master-список
+      var added = addMasterIds_(d.ids);                    // новые товары — в master-список
       var goods = fetchGoodsByIds_(d.ids);
       var res = goods.length ? pushFeed_(goods) : 'нет карточек';
       logStatus_('Обновление сайта', 'OK', 'изменённых: ' + goods.length + ' | ' + res, started);
+      try { notifyNewGoods_(added, goods); } catch (e2) { Logger.log('notifyNewGoods_: ' + e2.message); }
     } else {
       // «Изменений нет» в журнал НЕ пишем: это 288 пустых строк в сутки, журнал становится
       // нечитаемым (решение 25.07). Вместо этого — отметка «жив» раз в сутки, чтобы было видно,
@@ -468,11 +469,36 @@ function syncFullToTilda_() {
 
 // master-список good_id (что синхроним): хранится строкой в Script Property.
 function masterIds_() { var s = prop_('MASTER_GOOD_IDS') || ''; return s ? s.split(',') : []; }
+// Добавляет good_id в master-список. Возвращает те, которых раньше не было, — это ПОТЕНЦИАЛЬНО
+// новые товары: карточки в Тильде для них нет, а сами мы её не создаём (см. notifyNewGoods_).
 function addMasterIds_(ids) {
   var have = {}; masterIds_().forEach(function (x) { have[x] = 1; });
-  var changed = false;
-  ids.forEach(function (x) { x = String(x); if (!have[x]) { have[x] = 1; changed = true; } });
-  if (changed) props_().setProperty('MASTER_GOOD_IDS', Object.keys(have).join(','));
+  var added = [];
+  ids.forEach(function (x) { x = String(x); if (!have[x]) { have[x] = 1; added.push(x); } });
+  if (added.length) props_().setProperty('MASTER_GOOD_IDS', Object.keys(have).join(','));
+  return added;
+}
+
+// Новый товар в YClients: карточку на сайте Тильда САМА не создаёт (галка «создавать новые» ВЫКЛ —
+// иначе на сайт полезут названия из прайсов поставщиков без фото и описаний). Поэтому просто
+// сообщаем Ирине: вот товар, вот External ID, который надо поставить в карточке. Дальше остаток
+// и цена поедут автоматически.
+function notifyNewGoods_(addedIds, goods) {
+  if (!addedIds.length) return;
+  var byId = {}; (goods || []).forEach(function (g) { byId[String(g.good_id)] = g; });
+  var lines = addedIds.map(function (id) {
+    var g = byId[id] || {};
+    return '• ' + (g.title || 'без названия') + '  —  External ID для карточки: ' + tildaId_(id) +
+      (g.price ? ('  (цена ' + g.price + ' ₽') + (g.amount != null ? (', остаток ' + g.amount + ')') : ')') : '');
+  });
+  logStatus_('Новый товар в YClients', 'ВНИМАНИЕ',
+    'нужна карточка на сайте: ' + addedIds.map(function (id) { return (byId[id] || {}).title || id; }).join('; '), null);
+  sendErrorEmail_('[Тильда↔YClients] Новый товар — нужна карточка на сайте',
+    'В магазине YClients появился товар, которого раньше не было в синхронизации.\n\n' +
+    lines.join('\n') + '\n\n' +
+    'Что сделать: создать карточку на сайте (название, фото, описание — свои) и в поле\n' +
+    '«External ID» вписать код выше. После этого остаток и цена будут обновляться сами.\n' +
+    'Пока карточки нет — остаток и цена просто никуда не уходят, ничего не ломается.');
 }
 
 // Собирает import.xml + offers.xml по товарам и заливает в Тильду одним обменом.
@@ -1051,8 +1077,14 @@ function installTriggers_() {
     var f = t.getHandlerFunction();
     if (['syncStockToTilda_', 'syncFullToTilda_', 'purgeOldLogs_'].indexOf(f) !== -1) ScriptApp.deleteTrigger(t);
   });
-  ScriptApp.newTrigger('syncStockToTilda_').timeBased().everyMinutes(SYNC_INTERVAL_MIN_).create();   // инкремент 5 мин
-  ScriptApp.newTrigger('syncFullToTilda_').timeBased().everyDays(1).atHour(4).create();               // полная сверка ночью
+  ScriptApp.newTrigger('syncStockToTilda_').timeBased().everyMinutes(SYNC_INTERVAL_MIN_).create();   // остатки — 5 мин
+  // Полная сверка 3 раза в сутки. Зачем не только ночью: ИЗМЕНЕНИЕ ЦЕНЫ не создаёт складской
+  // операции, поэтому пятиминутка его не видит — цену подтягивает только полная сверка. Она
+  // стала дешёвой (~7 запросов, 24 с), поэтому 04:00 / 12:00 / 18:00 вместо раза в сутки:
+  // новая цена на сайте максимум через 8 часов, а не через сутки.
+  [4, 12, 18].forEach(function (h) {
+    ScriptApp.newTrigger('syncFullToTilda_').timeBased().everyDays(1).atHour(h).create();
+  });
   ScriptApp.newTrigger('purgeOldLogs_').timeBased().onMonthDay(1).atHour(5).create();                 // чистка журнала раз в месяц
   return ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); });
 }
