@@ -888,6 +888,17 @@ function doGet(e) {
           проверка: ((((after || {}).data || {}).goods_transactions) || []).map(function (t) { return t.comment; }) });
       }
       case 'retryNow': return jsonOut_({ ok: true, результат: retryPending_() });
+      // Прочитать складской документ целиком (только чтение) — сверка конкретного заказа.
+      case 'opDoc': {
+        var od = ycGet_('/storage_operations/operation/' + companyId_() + '/' + String(p.doc || ''));
+        var dd = (od || {}).data || {};
+        return jsonOut_({ ok: true, документ: dd.document_id || dd.id, тип: dd.type_id, склад: dd.storage_id,
+          дата: dd.create_date, комментарий: dd.comment, мастер: dd.master_id,
+          позиции: (dd.goods_transactions || []).map(function (t) {
+            return { id: t.id, товар: (t.good || {}).title || t.good_id, кол: t.amount,
+                     сумма: t.cost, комментарий: t.comment, мастер: t.master_id };
+          }) });
+      }
       // Какие листы есть в журнал-таблице и сколько в них строк.
       case 'sheets': {
         var ss = SpreadsheetApp.openById(requireProp_('CONTROL_SHEET_ID'));
