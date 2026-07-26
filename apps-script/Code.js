@@ -12,8 +12,7 @@
  */
 
 // ─── Конфиг: всё чувствительное — в Script Properties, НЕ в коде ───────────────
-var OWNER_EMAIL_ = 'irinkadirinkad@gmail.com';
-var DIAG_SECRET_ = 'tz_yc_8b3f1a7d';   // гейт служебного doGet (диагностика/настройка). После обкатки сузить.
+var OWNER_EMAIL_ = 'irinkadirinkad@gmail.com';   // он же — единственный, кому доступен служебный doGet
 var YC_BASE_ = 'https://api.yclients.com/api/v1';
 var YC_ACCEPT_ = 'application/vnd.yclients.v2+json';
 var SYNC_INTERVAL_MIN_ = 5;
@@ -830,13 +829,25 @@ function nextOrderNo_() {
 function isProcessed_(tranid) { return !!prop_('order_' + tranid); }
 function markProcessed_(tranid) { props_().setProperty('order_' + tranid, String(new Date())); }
 
-// ─── Диагностика (doGet, гейт по секрету; после разбора удалить) ───────────────
+// ─── Диагностика (doGet: только владелец) ─────────────────────────────────────
+// Веб-приложение обязано быть анонимным — иначе Тильда не сможет постить вебхук (doPost).
+// Но служебные действия анонимными быть не должны: раньше их прикрывал пароль, зашитый в код,
+// и любой, кто знал URL и пароль, мог переписать Script Properties или создать складскую
+// операцию. Теперь пароля нет вовсе — doGet отвечает ТОЛЬКО владельцу.
+// Проверено на боевом 26.07: анонимный вызов /exec → getActiveUser() пустой,
+// вызов владельца по /dev с OAuth-токеном → его почта. Значит различение надёжное.
+// Как звать: см. скил my-skill-proverka-integracii (@HEAD-деплой /dev + Authorization: Bearer).
+function isOwnerCall_() {
+  try { return String(Session.getActiveUser().getEmail() || '') === OWNER_EMAIL_; }
+  catch (e) { return false; }
+}
+
 function doGet(e) {
   var p = (e && e.parameter) || {};
-  if (p.secret !== DIAG_SECRET_) { bumpHit_('HITS_GET_DENIED'); return jsonOut_({ ok: false, error: 'forbidden' }); }
+  if (!isOwnerCall_()) { bumpHit_('HITS_GET_DENIED'); return jsonOut_({ ok: false, error: 'forbidden' }); }
   try {
     switch (p.action) {
-      case 'ping': return jsonOut_({ ok: true, ts: String(new Date()) });
+      case 'ping': return jsonOut_({ ok: true, ts: String(new Date()), owner: true });
       // Разовая установка доступов в Script Properties (значения приходят параметрами).
       case 'setup': {
         var keys = ['PARTNER_TOKEN', 'USER_TOKEN', 'COMPANY_ID', 'WRITEOFF_MASTER_ID', 'TILDA_CML_URL', 'TILDA_CML_LOGIN', 'TILDA_CML_PASS', 'TILDA_PRICE_ID', 'CONTROL_SHEET_ID', 'STORE_STORAGE_ID', 'LAST_SYNC_TS', 'ORDER_SEQ_NEXT', 'TX_SEEN'];

@@ -10,15 +10,32 @@ description: Проверка здоровья интеграции Тильда
 
 ## 0. Доступ (нужен один раз за сессию)
 
-Служебные действия живут на `@HEAD`-деплое и требуют токена Google:
+Служебный `doGet` отвечает **только владельцу** (`Session.getActiveUser()` = `OWNER_EMAIL_`);
+пароля в запросе нет — с 26.07 он из кода убран. Значит нужен OAuth-токен Ирины.
+Боевой деплой (URL вебхука в Тильде) для диагностики НЕ трогаем — работаем по `@HEAD`.
 
-```
-clasp login --no-localhost     # ссылку Ирине, она вернёт redirect-URL
-```
+Вход (⚠️ `clasp login --no-localhost` НЕ годится: Google больше не принимает OOB-редирект —
+ссылка откроется, но код не выдаст). Рабочий путь — ручной обмен:
 
-Готовый помощник (обновляет токен и зовёт действие) — см. «Шпаргалку» ниже.
-Секрет диагностики — константа `DIAG_SECRET_` в `apps-script/Code.js` (репозиторий приватный).
-Боевой деплой (URL вебхука в Тильде) для диагностики НЕ трогаем.
+1. Установить clasp: `npm install -g @google/clasp@2.4.2`.
+2. Собрать ссылку авторизации с `redirect_uri=http://localhost` и клиентом clasp
+   (`client_id`/`client_secret` — в `node_modules/@google/clasp/build/src/auth.js`),
+   скоупы: `script.projects script.deployments script.webapp.deploy drive.file
+   drive.metadata.readonly userinfo.email userinfo.profile cloud-platform
+   service.management logging.read`, плюс `access_type=offline&prompt=consent`.
+3. Ирина открывает, разрешает, попадает на «сайт недоступен» — **присылает адрес из строки
+   браузера целиком** (в нём `code=...`).
+4. Обменять `code` на токены (`POST https://oauth2.googleapis.com/token`) и записать
+   `~/.clasprc.json` в формате clasp 2.4.2:
+   `{ "token": {access_token, refresh_token, scope, token_type, expiry_date},
+      "oauth2ClientSettings": {clientId, clientSecret, redirectUri:"http://localhost"},
+      "isLocalCreds": false }`.
+5. Проверка: `clasp deployments` показывает два деплоя — `@HEAD` и боевой.
+
+⚠️ **`clasp push` из `apps-script/` падает** с `ENOENT: scandir ''` — виноват `rootDir: ""`
+в `.clasp.json` (clasp 2.4.2 читает его как путь). Не править файл в репозитории: сделать
+во временной папке копию `.clasp.json` с `rootDir` = абсолютный путь к `apps-script`
+и запускать `clasp push` оттуда.
 
 ## 1. Что проверить — по порядку
 
@@ -71,20 +88,25 @@ https://store.tildaapi.com/api/getproductslist/?storepartuid=<uid>&recid=<recid>
 
 ```bash
 #!/bin/bash
-# обновляет токен clasp при необходимости и вызывает служебное действие
+# обновляет токен при необходимости и вызывает служебное действие
 node -e '
 const fs=require("fs");const p=process.env.HOME+"/.clasprc.json";
-const s=JSON.parse(fs.readFileSync(p,"utf8"));const t=s.tokens.default;
+const s=JSON.parse(fs.readFileSync(p,"utf8"));const t=s.token;const c=s.oauth2ClientSettings;
 if(t.expiry_date && t.expiry_date>Date.now()+60000){process.exit(0);}
-const body=new URLSearchParams({client_id:t.client_id,client_secret:t.client_secret,
+const body=new URLSearchParams({client_id:c.clientId,client_secret:c.clientSecret,
   refresh_token:t.refresh_token,grant_type:"refresh_token"});
 fetch("https://oauth2.googleapis.com/token",{method:"POST",body}).then(r=>r.json()).then(j=>{
  t.access_token=j.access_token;t.expiry_date=Date.now()+(j.expires_in-120)*1000;
  fs.writeFileSync(p,JSON.stringify(s,null,2));});' 2>/dev/null
-AT=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.HOME+"/.clasprc.json","utf8")).tokens.default.access_token)')
+sleep 1
+AT=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.HOME+"/.clasprc.json","utf8")).token.access_token)')
 curl -sS -L --max-time 300 -H "Authorization: Bearer $AT" --get \
-  "https://script.google.com/macros/s/<HEAD_DEPLOY_ID>/exec" \
-  --data-urlencode "secret=<DIAG_SECRET_ из Code.js>" "$@"
+  "https://script.google.com/macros/s/<HEAD_DEPLOY_ID>/dev" "$@"
 ```
 
+⚠️ У `@HEAD`-деплоя адрес заканчивается на **`/dev`**, а не `/exec` — с `/exec` Google отдаёт
+«Page Not Found», и это легко принять за поломку скрипта.
 ⚠️ Каждый параметр — отдельным `--data-urlencode`, иначе действие не распознаётся.
+⚠️ Для проверки вебхука POST'ом не ставить `-X POST` вместе с `-L`: curl потащит POST на
+адрес-эхо и вернёт 405, как будто приёмник сломан. Правильно: `curl -sSL "$URL" -d "test=test"`
+(ожидаемо `{"ok":true,"test":true}` за ~2 с).
