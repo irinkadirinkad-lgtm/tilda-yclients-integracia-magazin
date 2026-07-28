@@ -430,6 +430,11 @@ function syncStockToTilda_() {
       var goods = fetchGoodsSmart_(d.ids);                // поштучно или каталогом — что дешевле
       if (goods.length) cmlCooldown_();                   // дать коннектору Тильды отдышаться
       var res = goods.length ? pushFeedBatched_(goods) : 'нет карточек';
+      // Запас прочности: после любого движения по складу заставляем ближайшую полную сверку
+      // отправить всё целиком, не полагаясь на сравнение. Строго говоря, сравнение и так
+      // заметило бы разницу (оно идёт по свежим цифрам YClients), но движения — событие редкое,
+      // а лишняя контрольная отправка после продажи стоит дёшево.
+      if (goods.length) props_().deleteProperty('FULL_FEED_HASH');
       logStatus_('Обновление сайта', 'OK', 'изменённых: ' + goods.length + ' | ' + res, started);
     } else {
       // «Изменений нет» в журнал НЕ пишем: это 288 пустых строк в сутки, журнал становится
@@ -547,19 +552,53 @@ function syncFullToTilda_() {
     var all = fetchStoreGoods_();
     var goods = all.filter(function (g) { return want[String(g.good_id)]; });
 
+    // Отпечаток того, что реально уезжает на сайт: товар + остаток + цена. Названия и артикулы
+    // в отпечаток НЕ входят — мы их не синхронизируем, Тильда их игнорирует, и их правки не
+    // должны гонять заливку впустую.
+    var fp = feedFingerprint_(goods);
+    var today = formatDate_(started).slice(0, 10);
+    var forced = prop_('FULL_FORCE_DAY') !== today;   // раз в сутки шлём принудительно
+    var same = !forced && prop_('FULL_FEED_HASH') === fp;
+
+    var pushed = 0, batches = 0;
+    if (same) {
+      // Цифры совпали с прошлой отправкой — на сайте уже ровно это. Идти в Тильду незачем:
+      // именно эти холостые обмены и создавали столкновения с пятиминуткой.
+      props_().setProperty('LAST_SYNC_TS', formatDate_(started));
+      logStatus_('Полная сверка сайта', 'OK', 'изменений нет, на сайт не отправляли (проверено товаров: ' +
+        goods.length + ' из ' + ids.length + ')', started);
+      return { изменений: 0, проверено: goods.length, вMaster: ids.length, вКаталоге: all.length, отправляли: false };
+    }
+
     cmlCooldown_();                             // дать коннектору Тильды отдышаться после прошлого прогона
     pushFeedBatched_(goods);                    // партии по 250 с паузами (см. pushFeedBatched_)
-    var pushed = goods.length, batches = Math.ceil(goods.length / FEED_BATCH_);
+    pushed = goods.length; batches = Math.ceil(goods.length / FEED_BATCH_);
+    // ⚠️ Отпечаток сохраняем ТОЛЬКО после успешной отправки. Сохранить его раньше — значит при
+    // сбое заливки навсегда решить, что «на сайте уже всё правильно», и больше не отправлять.
+    props_().setProperty('FULL_FEED_HASH', fp);
+    if (forced) props_().setProperty('FULL_FORCE_DAY', today);
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
-    logStatus_('Полная сверка сайта', 'OK', 'сверено товаров: ' + pushed + ' из ' + ids.length +
-      ' (в каталоге ' + all.length + '), партий: ' + batches, started);
-    return { сверено: pushed, вMaster: ids.length, вКаталоге: all.length, партий: batches };
+    logStatus_('Полная сверка сайта', 'OK', 'отправлено товаров: ' + pushed + ' из ' + ids.length +
+      ' (в каталоге ' + all.length + '), партий: ' + batches + (forced ? ' | суточная контрольная отправка' : ''), started);
+    return { отправлено: pushed, вMaster: ids.length, вКаталоге: all.length, партий: batches,
+             суточнаяКонтрольная: forced, отправляли: true };
   } catch (e) {
     reportError_('Полная сверка сайта', e, started);
     throw e;
   } finally {
     lock.releaseLock();
   }
+}
+
+// Отпечаток фида: товар + остаток + цена, отсортировано по товару, свёрнуто в короткий хеш.
+// Сортировка обязательна — иначе порядок страниц YClients менял бы отпечаток на пустом месте.
+function feedFingerprint_(goods) {
+  var parts = goods.map(function (g) {
+    return String(g.good_id) + ':' + Number(g.amount || 0) + ':' + Number(g.price || 0);
+  }).sort();
+  var raw = parts.join(',');
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, raw, Utilities.Charset.UTF_8)
+    .map(function (b) { return ('0' + (b & 0xFF).toString(16)).slice(-2); }).join('') + '/' + parts.length;
 }
 
 // master-список good_id (что синхроним): хранится строкой в Script Property.
@@ -896,7 +935,7 @@ function doGet(e) {
       case 'ping': return jsonOut_({ ok: true, ts: String(new Date()), owner: true });
       // Разовая установка доступов в Script Properties (значения приходят параметрами).
       case 'setup': {
-        var keys = ['PARTNER_TOKEN', 'USER_TOKEN', 'COMPANY_ID', 'WRITEOFF_MASTER_ID', 'TILDA_CML_URL', 'TILDA_CML_LOGIN', 'TILDA_CML_PASS', 'TILDA_PRICE_ID', 'CONTROL_SHEET_ID', 'STORE_STORAGE_ID', 'LAST_SYNC_TS', 'ORDER_SEQ_NEXT', 'TX_SEEN'];
+        var keys = ['PARTNER_TOKEN', 'USER_TOKEN', 'COMPANY_ID', 'WRITEOFF_MASTER_ID', 'TILDA_CML_URL', 'TILDA_CML_LOGIN', 'TILDA_CML_PASS', 'TILDA_PRICE_ID', 'CONTROL_SHEET_ID', 'STORE_STORAGE_ID', 'LAST_SYNC_TS', 'ORDER_SEQ_NEXT', 'TX_SEEN', 'FULL_FEED_HASH', 'FULL_FORCE_DAY'];
         var set = [];
         keys.forEach(function (k) { if (p[k] != null && p[k] !== '') { props_().setProperty(k, String(p[k])); set.push(k); } });
         return jsonOut_({ ok: true, set: set });
