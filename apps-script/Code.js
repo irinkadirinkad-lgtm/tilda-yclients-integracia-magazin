@@ -340,6 +340,18 @@ function commerceEnvelope_(body) {
 
 // Обмен по протоколу 1С-CommerceML (проверено на боевом коннекторе Тильды):
 // checkauth → init → (file → import) для каждого файла. files = [{name, xml}].
+// Замок разводит НАШИ прогоны, но коннектор Тильды после обмена ещё какое-то время занят.
+// Выдерживаем паузу от последней заливки ПРОШЛОГО прогона — иначе новый обмен получит «busy».
+// Вызывать один раз в начале прогона, а НЕ внутри pushCommerceML_: партии одного прогона
+// расходятся своей паузой в 8 с, и 45 с между ними были бы лишней тратой времени.
+var CML_COOLDOWN_MS_ = 45000;
+function cmlCooldown_() {
+  var lastPush = Number(prop_('CML_LAST_PUSH_TS') || 0);
+  if (!lastPush) return;
+  var waitMs = CML_COOLDOWN_MS_ - (Date.now() - lastPush);
+  if (waitMs > 0) Utilities.sleep(Math.min(waitMs, CML_COOLDOWN_MS_));
+}
+
 function pushCommerceML_(files) {
   var base = requireProp_('TILDA_CML_URL');
   var auth = 'Basic ' + Utilities.base64Encode(requireProp_('TILDA_CML_LOGIN') + ':' + requireProp_('TILDA_CML_PASS'));
@@ -366,18 +378,36 @@ function pushCommerceML_(files) {
   // 3-4. file + import для каждого файла
   var out = [];
   files.forEach(function (f) {
-    var fr = UrlFetchApp.fetch(base + '?type=catalog&mode=file&filename=' + encodeURIComponent(f.name),
-      { method: 'post', headers: hdr, contentType: 'application/xml; charset=UTF-8', payload: f.xml, muteHttpExceptions: true });
-    if (fr.getContentText().indexOf('success') === -1) throw new Error('Tilda file ' + f.name + ': ' + fr.getContentText().slice(0, 200));
+    // Коннектор у Тильды ОДИН на проект: пока он дожёвывает прошлый файл, новый не принимает
+    // («Connector is busy. Please wait.»). Это не поломка, а очередь — ждём и повторяем.
+    var fr = null, ftxt = '';
+    for (var a = 1; a <= 4; a++) {
+      fr = UrlFetchApp.fetch(base + '?type=catalog&mode=file&filename=' + encodeURIComponent(f.name),
+        { method: 'post', headers: hdr, contentType: 'application/xml; charset=UTF-8', payload: f.xml, muteHttpExceptions: true });
+      ftxt = fr.getContentText();
+      if (ftxt.indexOf('success') !== -1) break;
+      if (a === 4 || ftxt.toLowerCase().indexOf('busy') === -1) {
+        throw new Error('Tilda file ' + f.name + ': ' + ftxt.slice(0, 200));
+      }
+      Utilities.sleep(a * 10000);              // 10 с, 20 с, 30 с
+    }
+    // Разбор файла на стороне Тильды. Ждём до 2 минут (было 45 с — на больших партиях не хватало).
     var res = 'progress';
-    for (var i = 0; i < 30 && res.indexOf('progress') === 0; i++) {
+    for (var i = 0; i < 60 && res.indexOf('progress') === 0; i++) {
       var ir = UrlFetchApp.fetch(base + '?type=catalog&mode=import&filename=' + encodeURIComponent(f.name), { headers: hdr, muteHttpExceptions: true });
       res = ir.getContentText();
-      if (res.indexOf('progress') === 0) Utilities.sleep(1500);
+      if (res.indexOf('progress') === 0) Utilities.sleep(2000);
     }
-    if (res.indexOf('success') !== 0) throw new Error('Tilda import ' + f.name + ': ' + res.slice(0, 200));
+    // ⚠️ «progress» по истечении ожидания — НЕ ошибка: Тильда продолжает разбирать файл сама,
+    // данные дойдут. Раньше на этом падали и слали письмо на ровном месте. Ошибкой считаем
+    // только явный отказ. Остаток мы шлём АБСОЛЮТНЫМ числом, поэтому неподтверждённая заливка
+    // в худшем случае выправится следующим прогоном — расхождение накопиться не может.
+    if (res.indexOf('success') !== 0 && res.indexOf('progress') !== 0) {
+      throw new Error('Tilda import ' + f.name + ': ' + res.slice(0, 200));
+    }
     out.push(f.name + ': ' + res.split(/\r?\n/)[0]);
   });
+  props_().setProperty('CML_LAST_PUSH_TS', String(Date.now()));
   return out.join(' | ');
 }
 
@@ -398,6 +428,7 @@ function syncStockToTilda_() {
     if (d.ids.length) {
       addMasterIds_(d.ids);                               // новые товары — в master-список
       var goods = fetchGoodsSmart_(d.ids);                // поштучно или каталогом — что дешевле
+      if (goods.length) cmlCooldown_();                   // дать коннектору Тильды отдышаться
       var res = goods.length ? pushFeedBatched_(goods) : 'нет карточек';
       logStatus_('Обновление сайта', 'OK', 'изменённых: ' + goods.length + ' | ' + res, started);
     } else {
@@ -413,7 +444,7 @@ function syncStockToTilda_() {
     }
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
   } catch (e) {
-    reportError_('Обновление сайта (каждые 5 мин)', e);
+    reportError_('Обновление сайта (каждые 5 мин)', e, started);
   } finally {
     lock.releaseLock();
   }
@@ -454,12 +485,26 @@ function changedGoodIdsNew_() {
 
   var prev = parseSeenTx_(prop_('TX_SEEN'));
   var first = !prop_('TX_SEEN');
+  // ⚠️ ВЫПАДЕНИЕ ИЗ ОКНА — НЕ УДАЛЕНИЕ (найдено 29.07 по письмам об ошибках). Окно скользит
+  // по ДАТАМ, поэтому ровно в полночь самый старый день уходит из выборки и все его операции
+  // выглядят «исчезнувшими». Каждую ночь из-за этого шла лишняя заливка — и стыкалась с часовой
+  // сверкой в 00:01, а коннектор Тильды не выносит два обмена подряд («Connector is busy»).
+  // В прогон, когда граница окна сдвинулась, пропажи не считаем удалениями: отличить настоящее
+  // удаление от выпадения по дате в этот момент нечем. Сравнивать по «самому старому номеру в
+  // окне» нельзя — тогда удаление самой старой операции не замечалось бы НИКОГДА.
+  // Пропущенное в этот единственный прогон подхватит полная сверка (она ежечасная).
+  var winStart = prop_('TX_WIN_START');
+  var winMoved = winStart !== d1;
+  if (winMoved) props_().setProperty('TX_WIN_START', d1);
   if (!first) {
     Object.keys(cur).forEach(function (id) { if (prev[id] === undefined) set[cur[id]] = 1; });   // появились
-    Object.keys(prev).forEach(function (id) { if (cur[id] === undefined) set[prev[id]] = 1; });  // исчезли (удаление)
+    if (!winMoved) {
+      Object.keys(prev).forEach(function (id) { if (cur[id] === undefined) set[prev[id]] = 1; }); // удалили
+    }
   }
   props_().setProperty('TX_SEEN', serializeSeenTx_(cur));
-  return { ids: Object.keys(set), первыйПрогон: first, операцийВОкне: Object.keys(cur).length };
+  return { ids: Object.keys(set), первыйПрогон: first, операцийВОкне: Object.keys(cur).length,
+           границаОкнаСдвинулась: winMoved };
 }
 
 // Компактное хранение «номер операции:товар» через запятую. Ограничиваем длину: у Script
@@ -502,6 +547,7 @@ function syncFullToTilda_() {
     var all = fetchStoreGoods_();
     var goods = all.filter(function (g) { return want[String(g.good_id)]; });
 
+    cmlCooldown_();                             // дать коннектору Тильды отдышаться после прошлого прогона
     pushFeedBatched_(goods);                    // партии по 250 с паузами (см. pushFeedBatched_)
     var pushed = goods.length, batches = Math.ceil(goods.length / FEED_BATCH_);
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
@@ -509,7 +555,7 @@ function syncFullToTilda_() {
       ' (в каталоге ' + all.length + '), партий: ' + batches, started);
     return { сверено: pushed, вMaster: ids.length, вКаталоге: all.length, партий: batches };
   } catch (e) {
-    reportError_('Полная сверка сайта', e);
+    reportError_('Полная сверка сайта', e, started);
     throw e;
   } finally {
     lock.releaseLock();
@@ -1015,7 +1061,7 @@ function doGet(e) {
       // Создать таблицу-журнал и запомнить её id.
       case 'createControl': { var cs = SpreadsheetApp.create('tilda-yclients — журнал интеграции'); props_().setProperty('CONTROL_SHEET_ID', cs.getId()); statusSheet_(); return jsonOut_({ ok: true, id: cs.getId(), url: cs.getUrl() }); }
       case 'installTriggers': return jsonOut_({ ok: true, triggers: installTriggers_() });
-      case 'changedNew': { var cn = changedGoodIdsNew_(); return jsonOut_({ ok: true, изменившихсяТоваров: cn.ids.length, товары: cn.ids, операцийВОкне: cn.операцийВОкне, первыйПрогон: cn.первыйПрогон }); }
+      case 'changedNew': { var cn = changedGoodIdsNew_(); return jsonOut_({ ok: true, изменившихсяТоваров: cn.ids.length, товары: cn.ids, операцийВОкне: cn.операцийВОкне, первыйПрогон: cn.первыйПрогон, границаОкнаСдвинулась: cn.границаОкнаСдвинулась }); }
       // Запомнить текущее состояние без отправки на сайт (чтобы первый прогон не залил всё разом).
       case 'primeTx': { var pt = changedGoodIdsNew_(); return jsonOut_({ ok: true, операцийЗапомнено: pt.операцийВОкне }); }
       case 'runInc': syncStockToTilda_(); return jsonOut_({ ok: true, lastSync: prop_('LAST_SYNC_TS') });
@@ -1033,10 +1079,13 @@ function doGet(e) {
 }
 
 // ─── Почта об ошибках + лист «Статус автоматики» (копия паттерна финансовой интеграции) ──
-function reportError_(where, e) {
+// started — начало прогона, чтобы в журнале стояла реальная длительность. Раньше сюда
+// подставлялось текущее время, и все ошибки показывали «94 мс» — цифра, которая сбивает с толку
+// при разборе (выглядит так, будто прогон и не начинался).
+function reportError_(where, e, started) {
   var msg = String((e && e.message) || e);
   sendErrorEmail_('[Тильда↔YClients] Ошибка: ' + where, where + '\n\n' + msg + '\n\n' + (e && e.stack ? e.stack : ''));
-  logStatus_(where, 'ОШИБКА', msg, new Date());
+  logStatus_(where, 'ОШИБКА', msg, started || null);
 }
 
 function sendErrorEmail_(subject, body) {
