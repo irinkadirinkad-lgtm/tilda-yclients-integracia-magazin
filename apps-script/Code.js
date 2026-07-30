@@ -973,6 +973,16 @@ function doGet(e) {
           проверка: ((((after || {}).data || {}).goods_transactions) || []).map(function (t) { return t.comment; }) });
       }
       case 'retryNow': return jsonOut_({ ok: true, результат: retryPending_() });
+      // Письмо-заметка Ирине на OWNER_EMAIL_ (списки к ручной правке, сводки, напоминания).
+      // Живёт здесь потому, что почтовый отправитель уже есть, а заводить ради письма отдельный
+      // проект — лишнее. Доступно только владельцу (как весь doGet). Ничего не читает и не пишет
+      // в данные интеграции: сбой письма не может задеть остатки или заказы.
+      case 'mailNote': {
+        var mnSubj = String(p.subject || '').trim(), mnText = String(p.text || '').trim();
+        if (!mnSubj || !mnText) return jsonOut_({ ok: false, error: 'нужны subject и text' });
+        sendErrorEmail_(mnSubj, mnText);
+        return jsonOut_({ ok: true, кому: OWNER_EMAIL_, тема: mnSubj, длина: mnText.length });
+      }
       // Прочитать складской документ целиком (только чтение) — сверка конкретного заказа.
       case 'opDoc': {
         var od = ycGet_('/storage_operations/operation/' + companyId_() + '/' + String(p.doc || ''));
