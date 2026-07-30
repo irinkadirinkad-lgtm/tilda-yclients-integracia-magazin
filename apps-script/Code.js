@@ -1182,6 +1182,7 @@ function purgeOldLogs_() {
   var now = new Date();
   var cutoff = new Date(now.getFullYear(), now.getMonth() - LOG_RETENTION_MONTHS_, now.getDate());
   var total = 0;
+  // Журнальные листы пишутся строго хронологически → режем сверху до первой свежей строки.
   ['Статус автоматики', 'Несопоставленные'].forEach(function (name) {
     var sh = ss.getSheetByName(name);
     if (!sh) return;
@@ -1198,10 +1199,30 @@ function purgeOldLogs_() {
     }
     if (del > 0) { sh.deleteRows(2, del); total += del; }
   });
+  total += purgeRetryQueue_(ss, cutoff);
   // старые ключи идемпотентности заказов тоже подчистим (свойства order_*), чтобы не копились
   purgeOldOrderKeys_(cutoff);
   logStatus_('Очистка журнала (раз в месяц)', 'OK', 'удалено строк старше ' + LOG_RETENTION_MONTHS_ + ' мес.: ' + total, now);
   return total;
+}
+
+// ⚠️ «Очередь повторов» чистится ОТДЕЛЬНО и НЕ по хронологии (добавлено 30.07 — лист копился
+// с самого начала, в уборку не попадал). Резать сверху здесь нельзя: строка «ждёт» — это не
+// мусор, а недоставленная подпись, которую пятиминутка ещё доберёт; удалить её = потерять
+// работу. Убираем только РАЗОБРАННЫЕ строки («готово» / «не удалось») старше месяца,
+// а «ждёт» оставляем при любом возрасте: висит месяц — это сигнал, а не хлам.
+function purgeRetryQueue_(ss, cutoff) {
+  var sh = ss.getSheetByName('Очередь повторов');
+  if (!sh || sh.getLastRow() < 2) return 0;
+  var vals = sh.getDataRange().getValues(), del = 0;
+  for (var r = vals.length - 1; r >= 1; r--) {
+    if (String(vals[r][7]) === 'ждёт') continue;
+    var d = vals[r][0];
+    var rd = (d instanceof Date) ? d : new Date(String(d).replace('T', ' '));
+    if (!isNaN(rd.getTime()) && rd >= cutoff) continue;
+    sh.deleteRow(r + 1); del++;
+  }
+  return del;
 }
 
 function purgeOldOrderKeys_(cutoff) {
