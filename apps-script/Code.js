@@ -71,11 +71,35 @@ function ycPace_() {
   _ycLastCallAt_ = new Date().getTime();
 }
 
+// ⚠️ ОБРЫВ СВЯЗИ — НЕ ТО ЖЕ САМОЕ, ЧТО ПЛОХОЙ ОТВЕТ (урок 02.08 на интеграции Ozon).
+// Когда до сервера не доехали вовсе, `UrlFetchApp.fetch` бросает исключение ДО всякого
+// HTTP-кода, и повторы «по коду ответа» до него просто не доходят: одна моргнувшая секунда
+// роняет весь прогон. Здесь повторяем сам обрыв — коротко (2 с, 6 с), потому что обрыв
+// лечится секундами, а у триггера всего 6 минут.
+// ⚠️ Применять ТОЛЬКО там, где повтор безопасен: чтение, PUT, заливка каталога абсолютными
+// остатками. Для POST, создающего продажу, — НЕЛЬЗЯ: ответ мог потеряться уже ПОСЛЕ того,
+// как YClients записал операцию, и повтор списал бы товар второй раз.
+// Нагрузки такой повтор не создаёт: несостоявшийся запрос сервера не коснулся.
+var NET_WAITS_ = [2000, 6000];
+function fetchNet_(url, opts) {
+  var last = null;
+  for (var i = 0; i <= NET_WAITS_.length; i++) {
+    try { return UrlFetchApp.fetch(url, opts); }
+    catch (e) {
+      last = e;
+      if (i === NET_WAITS_.length) break;
+      Utilities.sleep(NET_WAITS_[i]);
+    }
+  }
+  // Пометка узнаваемая: по ней reportError_ отличает помеху связи от настоящей поломки.
+  throw new Error('Связь не состоялась: ' + String(last && last.message || last));
+}
+
 function ycFetch_(url, opts, idempotent) {
   var WAITS = [3000, 9000, 20000], resp = null;
   for (var i = 0; i <= WAITS.length; i++) {
     ycPace_();
-    resp = UrlFetchApp.fetch(url, opts);
+    resp = idempotent ? fetchNet_(url, opts) : UrlFetchApp.fetch(url, opts);
     var code = resp.getResponseCode();
     var retryable = (code === 429) || (idempotent && code >= 500 && code < 600);
     if (!retryable || i === WAITS.length) return resp;
@@ -361,7 +385,7 @@ function pushCommerceML_(files) {
   // ускорили, заливки пошли подряд и упёрлись в лимит (25.07). Поэтому — повтор с ожиданием.
   var r = null, lines = null;
   for (var att = 1; att <= 4; att++) {
-    r = UrlFetchApp.fetch(base + '?type=catalog&mode=checkauth', { headers: { Authorization: auth }, muteHttpExceptions: true });
+    r = fetchNet_(base + '?type=catalog&mode=checkauth', { headers: { Authorization: auth }, muteHttpExceptions: true });
     lines = r.getContentText().split(/\r?\n/);
     if (lines[0] === 'success') break;
     if (att === 4 || r.getContentText().toLowerCase().indexOf('many request') === -1) {
@@ -374,7 +398,7 @@ function pushCommerceML_(files) {
   if (setc) (Array.isArray(setc) ? setc : [setc]).forEach(function (c) { cookie += '; ' + String(c).split(';')[0]; });
   var hdr = { Authorization: auth, Cookie: cookie };
   // 2. init → zip=no\nfile_limit=NNN
-  UrlFetchApp.fetch(base + '?type=catalog&mode=init', { headers: hdr, muteHttpExceptions: true });
+  fetchNet_(base + '?type=catalog&mode=init', { headers: hdr, muteHttpExceptions: true });
   // 3-4. file + import для каждого файла
   var out = [];
   files.forEach(function (f) {
@@ -382,7 +406,7 @@ function pushCommerceML_(files) {
     // («Connector is busy. Please wait.»). Это не поломка, а очередь — ждём и повторяем.
     var fr = null, ftxt = '';
     for (var a = 1; a <= 4; a++) {
-      fr = UrlFetchApp.fetch(base + '?type=catalog&mode=file&filename=' + encodeURIComponent(f.name),
+      fr = fetchNet_(base + '?type=catalog&mode=file&filename=' + encodeURIComponent(f.name),
         { method: 'post', headers: hdr, contentType: 'application/xml; charset=UTF-8', payload: f.xml, muteHttpExceptions: true });
       ftxt = fr.getContentText();
       if (ftxt.indexOf('success') !== -1) break;
@@ -394,7 +418,7 @@ function pushCommerceML_(files) {
     // Разбор файла на стороне Тильды. Ждём до 2 минут (было 45 с — на больших партиях не хватало).
     var res = 'progress';
     for (var i = 0; i < 60 && res.indexOf('progress') === 0; i++) {
-      var ir = UrlFetchApp.fetch(base + '?type=catalog&mode=import&filename=' + encodeURIComponent(f.name), { headers: hdr, muteHttpExceptions: true });
+      var ir = fetchNet_(base + '?type=catalog&mode=import&filename=' + encodeURIComponent(f.name), { headers: hdr, muteHttpExceptions: true });
       res = ir.getContentText();
       if (res.indexOf('progress') === 0) Utilities.sleep(2000);
     }
@@ -422,7 +446,7 @@ function syncStockToTilda_() {
   // через 5 минут прогон повторится сам.
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(120000)) return;
-  try { retryPending_(); } catch (e) { reportError_('Очередь повторов', e); }   // сначала добираем недолитое
+  try { retryPending_(); noteOk_('Очередь повторов'); } catch (e) { reportError_('Очередь повторов', e, null, true); }   // сначала добираем недолитое
   try {
     var d = changedGoodIdsNew_();                         // {ids, maxId} — новые складские операции по номеру
     if (d.ids.length) {
@@ -448,8 +472,9 @@ function syncStockToTilda_() {
       }
     }
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
+    noteOk_('Обновление сайта (каждые 5 мин)');
   } catch (e) {
-    reportError_('Обновление сайта (каждые 5 мин)', e, started);
+    reportError_('Обновление сайта (каждые 5 мин)', e, started, true);
   } finally {
     lock.releaseLock();
   }
@@ -580,10 +605,11 @@ function syncFullToTilda_() {
     props_().setProperty('LAST_SYNC_TS', formatDate_(started));
     logStatus_('Полная сверка сайта', 'OK', 'отправлено товаров: ' + pushed + ' из ' + ids.length +
       ' (в каталоге ' + all.length + '), партий: ' + batches + (forced ? ' | суточная контрольная отправка' : ''), started);
+    noteOk_('Полная сверка сайта');
     return { отправлено: pushed, вMaster: ids.length, вКаталоге: all.length, партий: batches,
              суточнаяКонтрольная: forced, отправляли: true };
   } catch (e) {
-    reportError_('Полная сверка сайта', e, started);
+    reportError_('Полная сверка сайта', e, started, true);
     throw e;
   } finally {
     lock.releaseLock();
@@ -1131,10 +1157,32 @@ function doGet(e) {
 // started — начало прогона, чтобы в журнале стояла реальная длительность. Раньше сюда
 // подставлялось текущее время, и все ошибки показывали «94 мс» — цифра, которая сбивает с толку
 // при разборе (выглядит так, будто прогон и не начинался).
-function reportError_(where, e, started) {
+// Разовая помеха связи и настоящая поломка выглядят в коде одинаково, а для Ирины это разные
+// события: первое чинится само через 5 минут, второе требует её участия. Поэтому в ЖУРНАЛ
+// пишем всегда (нет следа — нет права утверждать, что всё было хорошо), а письмо по обрыву
+// связи придерживаем до второго сбоя ПОДРЯД. Успешный прогон обнуляет счётчик — значит письмо
+// приходит только когда связь не восстановилась сама. Решение Ирины 02.08, как на Ozon.
+var NET_GLITCH_RE_ = /связь не состоялась|адрес недоступен|address unavailable|таймаут|timed? ?out|превышено время|dns|connection (refused|reset|closed)|соединени/i;
+
+function failStreakKey_(where) { return 'FAILSTREAK_' + where; }
+function noteOk_(where) { try { props_().deleteProperty(failStreakKey_(where)); } catch (ignore) {} }
+
+// ⚠️ periodic=true ставим ТОЛЬКО у повторяющихся прогонов (пятиминутка, сверка, очередь):
+// там следующий заход через 5 минут сам всё подхватит, и придержать письмо безопасно.
+// У ЗАКАЗА С САЙТА придерживать НЕЛЬЗЯ: он приходит вебхуком один раз, повтора не будет —
+// придержанное письмо означало бы потерянный заказ, о котором Ирина не узнала.
+function reportError_(where, e, started, periodic) {
   var msg = String((e && e.message) || e);
-  sendErrorEmail_('[Тильда↔YClients] Ошибка: ' + where, where + '\n\n' + msg + '\n\n' + (e && e.stack ? e.stack : ''));
   logStatus_(where, 'ОШИБКА', msg, started || null);
+  var streak = 0;
+  if (periodic && NET_GLITCH_RE_.test(msg)) {
+    streak = Number(prop_(failStreakKey_(where)) || 0) + 1;
+    props_().setProperty(failStreakKey_(where), String(streak));
+    if (streak < 2) return;                       // моргнула сеть — ждём следующий прогон
+  }
+  sendErrorEmail_('[Тильда↔YClients] Ошибка: ' + where,
+    where + (streak > 1 ? '\n⚠️ Связь не восстановилась: сбой подряд ' + streak + '-й раз.' : '') +
+    '\n\n' + msg + '\n\n' + (e && e.stack ? e.stack : ''));
 }
 
 function sendErrorEmail_(subject, body) {
