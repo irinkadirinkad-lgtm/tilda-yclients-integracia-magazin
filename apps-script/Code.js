@@ -376,6 +376,17 @@ function cmlCooldown_() {
   if (waitMs > 0) Utilities.sleep(Math.min(waitMs, CML_COOLDOWN_MS_));
 }
 
+// ⚠️ Тильда иногда отвечает страницей «Error 502/503» вместо данных (проверено 04.08: суточная
+// контрольная отправка упала ровно на этом, а через час всё работало). Это её собственная
+// заминка, а не наша поломка: повторяем, как повторяем «busy», и оставляем в тексте узнаваемую
+// пометку — по ней reportError_ придержит письмо до второго сбоя ПОДРЯД.
+// Повтор безопасен: остаток шлётся АБСОЛЮТНЫМ числом, повторная заливка того же файла не может
+// ничего задвоить.
+function tildaDown_(resp) { var c = resp.getResponseCode(); return c >= 500 && c < 600; }
+function tildaDownMsg_(what, resp) {
+  return 'Tilda ' + what + ' → сервер Тильды не отвечает (HTTP ' + resp.getResponseCode() + ')';
+}
+
 function pushCommerceML_(files) {
   var base = requireProp_('TILDA_CML_URL');
   var auth = 'Basic ' + Utilities.base64Encode(requireProp_('TILDA_CML_LOGIN') + ':' + requireProp_('TILDA_CML_PASS'));
@@ -388,6 +399,8 @@ function pushCommerceML_(files) {
     r = fetchNet_(base + '?type=catalog&mode=checkauth', { headers: { Authorization: auth }, muteHttpExceptions: true });
     lines = r.getContentText().split(/\r?\n/);
     if (lines[0] === 'success') break;
+    if (att < 4 && tildaDown_(r)) { Utilities.sleep(att * 10000); continue; }
+    if (att === 4 && tildaDown_(r)) throw new Error(tildaDownMsg_('checkauth', r));
     if (att === 4 || r.getContentText().toLowerCase().indexOf('many request') === -1) {
       throw new Error('Tilda checkauth: ' + r.getContentText().slice(0, 200));
     }
@@ -410,26 +423,32 @@ function pushCommerceML_(files) {
         { method: 'post', headers: hdr, contentType: 'application/xml; charset=UTF-8', payload: f.xml, muteHttpExceptions: true });
       ftxt = fr.getContentText();
       if (ftxt.indexOf('success') !== -1) break;
-      if (a === 4 || ftxt.toLowerCase().indexOf('busy') === -1) {
+      var down = tildaDown_(fr);
+      if (a === 4 && down) throw new Error(tildaDownMsg_('file ' + f.name, fr));
+      if (a === 4 || (!down && ftxt.toLowerCase().indexOf('busy') === -1)) {
         throw new Error('Tilda file ' + f.name + ': ' + ftxt.slice(0, 200));
       }
       Utilities.sleep(a * 10000);              // 10 с, 20 с, 30 с
     }
     // Разбор файла на стороне Тильды. Ждём до 2 минут (было 45 с — на больших партиях не хватало).
-    var res = 'progress';
-    for (var i = 0; i < 60 && res.indexOf('progress') === 0; i++) {
+    var res = 'progress', down = false;
+    for (var i = 0; i < 60; i++) {
       var ir = fetchNet_(base + '?type=catalog&mode=import&filename=' + encodeURIComponent(f.name), { headers: hdr, muteHttpExceptions: true });
+      down = tildaDown_(ir);
       res = ir.getContentText();
-      if (res.indexOf('progress') === 0) Utilities.sleep(2000);
+      // 5xx на ЭТОМ шаге — не потеря: файл Тильда уже приняла (mode=file прошёл) и разбирает
+      // его сама. Ждём так же, как при «progress», а не падаем.
+      if (res.indexOf('progress') === 0 || down) { Utilities.sleep(2000); continue; }
+      break;
     }
     // ⚠️ «progress» по истечении ожидания — НЕ ошибка: Тильда продолжает разбирать файл сама,
     // данные дойдут. Раньше на этом падали и слали письмо на ровном месте. Ошибкой считаем
     // только явный отказ. Остаток мы шлём АБСОЛЮТНЫМ числом, поэтому неподтверждённая заливка
     // в худшем случае выправится следующим прогоном — расхождение накопиться не может.
-    if (res.indexOf('success') !== 0 && res.indexOf('progress') !== 0) {
+    if (!down && res.indexOf('success') !== 0 && res.indexOf('progress') !== 0) {
       throw new Error('Tilda import ' + f.name + ': ' + res.slice(0, 200));
     }
-    out.push(f.name + ': ' + res.split(/\r?\n/)[0]);
+    out.push(f.name + ': ' + (down ? 'подтверждения нет (HTTP 5xx), Тильда дочитывает сама' : res.split(/\r?\n/)[0]));
   });
   props_().setProperty('CML_LAST_PUSH_TS', String(Date.now()));
   return out.join(' | ');
@@ -1162,7 +1181,7 @@ function doGet(e) {
 // пишем всегда (нет следа — нет права утверждать, что всё было хорошо), а письмо по обрыву
 // связи придерживаем до второго сбоя ПОДРЯД. Успешный прогон обнуляет счётчик — значит письмо
 // приходит только когда связь не восстановилась сама. Решение Ирины 02.08, как на Ozon.
-var NET_GLITCH_RE_ = /связь не состоялась|адрес недоступен|address unavailable|таймаут|timed? ?out|превышено время|dns|connection (refused|reset|closed)|соединени/i;
+var NET_GLITCH_RE_ = /связь не состоялась|не отвечает \(HTTP 5|адрес недоступен|address unavailable|таймаут|timed? ?out|превышено время|dns|connection (refused|reset|closed)|соединени/i;
 
 function failStreakKey_(where) { return 'FAILSTREAK_' + where; }
 function noteOk_(where) { try { props_().deleteProperty(failStreakKey_(where)); } catch (ignore) {} }
