@@ -499,6 +499,20 @@ function syncStockToTilda_() {
   }
 }
 
+// Склад складской транзакции. ⚠️ НАЙДЕНО 17.08.2026 по жалобе Ирины «в каталог сайта лезет всё
+// подряд, и салонное тоже»: YClients отдаёт склад ОБЪЕКТОМ `storage: {id, title}`, поля
+// `storage_id` в транзакции НЕТ. Старая проверка `if (t.storage_id != null && ...)` читала
+// undefined, условие никогда не выполнялось — и фильтр по складу МОЛЧА пропускал всё, включая
+// приходы на «Основной склад» (расходники салона). Поэтому и склад берём только из `storage.id`,
+// и сравнение делаем строгим: неизвестный склад = НЕ магазин.
+// Урок: фильтр, который «на всякий случай» пропускает при отсутствии поля, при переименовании
+// поля превращается в отсутствие фильтра — и не жалуется.
+function txStorageId_(t) {
+  var s = t && t.storage;
+  var id = (s && s.id != null) ? s.id : (t ? t.storage_id : null);
+  return id == null ? '' : String(id);
+}
+
 // Новые складские операции с прошлого раза — по НОМЕРУ операции (id растёт; changed_after у YClients
 // не работает). Окно — вчера+сегодня (перехлёст на полночь). Возвращает {ids: [good_id...], maxId}.
 function changedGoodIdsNew_() {
@@ -528,7 +542,7 @@ function changedGoodIdsNew_() {
   rows.forEach(function (t) {
     var id = Number(t.id) || 0, g = t.good || {};
     if (!id || !g.id) return;
-    if (t.storage_id != null && String(t.storage_id) !== storageId) return;
+    if (txStorageId_(t) !== storageId) return;
     cur[id] = g.id;
   });
 
@@ -1155,6 +1169,75 @@ function doGet(e) {
       // Создать таблицу-журнал и запомнить её id.
       case 'createControl': { var cs = SpreadsheetApp.create('tilda-yclients — журнал интеграции'); props_().setProperty('CONTROL_SHEET_ID', cs.getId()); statusSheet_(); return jsonOut_({ ok: true, id: cs.getId(), url: cs.getUrl() }); }
       case 'installTriggers': return jsonOut_({ ok: true, triggers: installTriggers_() });
+      // Пересборка master-списка: что реально относится к МАГАЗИНУ, то и синхроним.
+      // Без `apply=1` ничего не меняет — только показывает, что будет убрано (dry-run).
+      // Критерий «магазинный»: есть движение по складу «Магазин» за `days` дней ИЛИ есть
+      // ненулевой остаток на нём. Второе обязательно: товар мог прийти давно и просто лежать.
+      case 'rebuildMaster': {
+        var days = Number(p.days || 365);
+        var sidWant = String(resolveStoreStorageId_());
+        var to = new Date(), from = new Date(to.getTime() - days * 24 * 3600 * 1000);
+        var shop = {}, other = {}, seen = 0, pg = 1;
+        while (pg <= 60) {
+          var rs = ycGet_('/storages/transactions/' + companyId_(), {
+            start_date: formatDate_(from).slice(0, 10), end_date: formatDate_(to).slice(0, 10),
+            count: 1000, page: pg });
+          var rws = (rs && rs.data) || [];
+          if (!rws.length) break;
+          rws.forEach(function (t) {
+            seen++;
+            var g = t.good || {}; if (!g.id) return;
+            if (txStorageId_(t) === sidWant) shop[String(g.id)] = 1; else other[String(g.id)] = 1;
+          });
+          if (rws.length < 1000) break;
+          pg++;
+        }
+        // ⚠️ Пересекаем с ЖИВЫМ каталогом: в истории операций остаются good_id товаров, давно
+        // удалённых из YClients. Их не существует, в фид они не попадут — но раздували бы master
+        // и путали цифры при сверке.
+        var catalog = fetchStoreGoods_(), inCatalog = {}, withStock = 0;
+        catalog.forEach(function (g) {
+          inCatalog[String(g.good_id)] = Number(g.amount) || 0;
+          // Товар без движений за период, но лежащий на складе магазина — тоже магазинный.
+          if (Number(g.amount) !== 0) { shop[String(g.good_id)] = 1; withStock++; }
+        });
+        Object.keys(shop).forEach(function (x) { if (inCatalog[x] === undefined) delete shop[x]; });
+
+        var before = masterIds_();
+        var keep = before.filter(function (x) { return shop[String(x)]; });
+        var drop = before.filter(function (x) { return !shop[String(x)]; });
+        // Товары склада магазина, которых в master ещё нет, — добавляем: иначе их не будет на сайте.
+        var add = Object.keys(shop).filter(function (x) { return before.indexOf(x) === -1; });
+
+        // ⚠️ Чем рискуем: товар, убранный из master, останется в каталоге Тильды с последними
+        // отправленными цифрами и перестанет обновляться. Если у него остаток > 0, его смогут
+        // купить. Поэтому считаем такие отдельно и показываем — это то, что надо убрать в Тильде.
+        var dropWithStock = drop.filter(function (x) { return (inCatalog[String(x)] || 0) > 0; });
+
+        var applied = false;
+        if (String(p.apply || '') === '1') {
+          props_().setProperty('MASTER_GOOD_IDS', keep.concat(add).join(','));
+          props_().deleteProperty('FULL_FEED_HASH');   // заставить ближайшую сверку отправить заново
+          applied = true;
+        }
+        return jsonOut_({ ok: true, применено: applied, дней: days, операцийПросмотрено: seen,
+          сОстаткомНаСкладеМагазин: withStock,
+          товаровМагазина: Object.keys(shop).length, товаровДругихСкладов: Object.keys(other).length,
+          былоВMaster: before.length, останется: keep.length + add.length,
+          уберём: drop.length, добавим: add.length,
+          убираемНоЕстьОстаток: dropWithStock.length, примерыТаких: dropWithStock.slice(0, 20),
+          примерыУбираемых: drop.slice(0, 10) });
+      }
+      // Выгрузка каталога для внешней сверки с сайтом (только чтение): good_id, остаток на
+      // складе магазина, цена, в master или нет. Нужна, чтобы сверять ключи Тильды с YClients.
+      case 'dumpGoods': {
+        var mstD = {}; masterIds_().forEach(function (x) { mstD[String(x)] = 1; });
+        var outD = fetchStoreGoods_().map(function (g) {
+          return [g.good_id, g.amount, g.price, mstD[String(g.good_id)] ? 1 : 0, g.title];
+        });
+        return jsonOut_({ ok: true, поля: ['good_id', 'остаток', 'цена', 'вMaster', 'название'],
+                          всего: outD.length, товары: outD });
+      }
       case 'changedNew': { var cn = changedGoodIdsNew_(); return jsonOut_({ ok: true, изменившихсяТоваров: cn.ids.length, товары: cn.ids, операцийВОкне: cn.операцийВОкне, первыйПрогон: cn.первыйПрогон, границаОкнаСдвинулась: cn.границаОкнаСдвинулась }); }
       // Запомнить текущее состояние без отправки на сайт (чтобы первый прогон не залил всё разом).
       case 'primeTx': { var pt = changedGoodIdsNew_(); return jsonOut_({ ok: true, операцийЗапомнено: pt.операцийВОкне }); }
