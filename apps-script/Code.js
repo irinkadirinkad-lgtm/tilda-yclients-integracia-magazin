@@ -1192,11 +1192,16 @@ function doGet(e) {
           if (rws.length < 1000) break;
           pg++;
         }
-        // Остатки: товар без движений за период, но лежащий на складе магазина — тоже магазинный.
-        var withStock = 0;
-        fetchStoreGoods_().forEach(function (g) {
+        // ⚠️ Пересекаем с ЖИВЫМ каталогом: в истории операций остаются good_id товаров, давно
+        // удалённых из YClients. Их не существует, в фид они не попадут — но раздували бы master
+        // и путали цифры при сверке.
+        var catalog = fetchStoreGoods_(), inCatalog = {}, withStock = 0;
+        catalog.forEach(function (g) {
+          inCatalog[String(g.good_id)] = Number(g.amount) || 0;
+          // Товар без движений за период, но лежащий на складе магазина — тоже магазинный.
           if (Number(g.amount) !== 0) { shop[String(g.good_id)] = 1; withStock++; }
         });
+        Object.keys(shop).forEach(function (x) { if (inCatalog[x] === undefined) delete shop[x]; });
 
         var before = masterIds_();
         var keep = before.filter(function (x) { return shop[String(x)]; });
@@ -1207,9 +1212,7 @@ function doGet(e) {
         // ⚠️ Чем рискуем: товар, убранный из master, останется в каталоге Тильды с последними
         // отправленными цифрами и перестанет обновляться. Если у него остаток > 0, его смогут
         // купить. Поэтому считаем такие отдельно и показываем — это то, что надо убрать в Тильде.
-        var stockById = {};
-        fetchStoreGoods_().forEach(function (g) { stockById[String(g.good_id)] = Number(g.amount) || 0; });
-        var dropWithStock = drop.filter(function (x) { return (stockById[String(x)] || 0) > 0; });
+        var dropWithStock = drop.filter(function (x) { return (inCatalog[String(x)] || 0) > 0; });
 
         var applied = false;
         if (String(p.apply || '') === '1') {
@@ -1224,6 +1227,16 @@ function doGet(e) {
           уберём: drop.length, добавим: add.length,
           убираемНоЕстьОстаток: dropWithStock.length, примерыТаких: dropWithStock.slice(0, 20),
           примерыУбираемых: drop.slice(0, 10) });
+      }
+      // Выгрузка каталога для внешней сверки с сайтом (только чтение): good_id, остаток на
+      // складе магазина, цена, в master или нет. Нужна, чтобы сверять ключи Тильды с YClients.
+      case 'dumpGoods': {
+        var mstD = {}; masterIds_().forEach(function (x) { mstD[String(x)] = 1; });
+        var outD = fetchStoreGoods_().map(function (g) {
+          return [g.good_id, g.amount, g.price, mstD[String(g.good_id)] ? 1 : 0, g.title];
+        });
+        return jsonOut_({ ok: true, поля: ['good_id', 'остаток', 'цена', 'вMaster', 'название'],
+                          всего: outD.length, товары: outD });
       }
       case 'changedNew': { var cn = changedGoodIdsNew_(); return jsonOut_({ ok: true, изменившихсяТоваров: cn.ids.length, товары: cn.ids, операцийВОкне: cn.операцийВОкне, первыйПрогон: cn.первыйПрогон, границаОкнаСдвинулась: cn.границаОкнаСдвинулась }); }
       // Запомнить текущее состояние без отправки на сайт (чтобы первый прогон не залил всё разом).
